@@ -1,0 +1,35 @@
+name: avito-bot
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch: {}
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r avito/bot/requirements.txt
+
+      - name: Write Google service account file
+        run: |
+          mkdir -p avito/bot/credentials
+          printf '%s' "$GOOGLE_SERVICE_ACCOUNT_JSON" > avito/bot/credentials/service_account.json
+        env:
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+
+      - name: Run bot cycle
+        run: python avito/bot/main.py
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          ADMIN_ID: ${{ secrets.ADMIN_ID }}
+          AVITO_CLIENT_ID: ${{ secrets.AVITO_CLIENT_ID }}
+          AVITO_CLIENT_SECRET: ${{ secrets.AVITO_CLIENT_SECRET }}
+          SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
