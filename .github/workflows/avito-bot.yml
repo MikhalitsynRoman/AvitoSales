@@ -5,9 +5,14 @@ on:
     - cron: "*/5 * * * *"
   workflow_dispatch: {}
 
+concurrency:
+  group: avito-bot
+  cancel-in-progress: false
+
 jobs:
   run:
     runs-on: ubuntu-latest
+    timeout-minutes: 8
     steps:
       - uses: actions/checkout@v4
 
@@ -28,6 +33,7 @@ jobs:
       - name: Run bot cycle
         run: python avito/bot/main.py
         env:
+          RUN_SECONDS: "270"
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           ADMIN_ID: ${{ secrets.ADMIN_ID }}
           AVITO_CLIENT_ID: ${{ secrets.AVITO_CLIENT_ID }}

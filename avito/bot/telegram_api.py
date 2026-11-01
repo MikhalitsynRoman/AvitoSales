@@ -39,6 +39,17 @@ def edit_message_reply_markup(chat_id: int, message_id: int, reply_markup: dict 
     )
 
 
+def edit_message_text(chat_id: int, message_id: int, text: str, reply_markup: dict | None = None) -> None:
+    payload = {"chat_id": chat_id, "message_id": message_id, "text": text}
+    if reply_markup is not None:
+        payload["reply_markup"] = reply_markup
+    requests.post(f"{API}/editMessageText", json=payload, timeout=15)
+
+
 def inline_keyboard(buttons: list[tuple[str, str]]) -> dict:
     """buttons: list of (label, callback_data), all placed in a single row."""
-    return {"inline_keyboard": [[{"text": label, "callback_data": data} for label, data in buttons]]}
+    return keyboard_rows([buttons])
+
+
+def keyboard_rows(rows: list[list[tuple[str, str]]]) -> dict:
+    return {"inline_keyboard": [[{"text": label, "callback_data": data} for label, data in row] for row in rows]}
