@@ -11,23 +11,81 @@ from config import ADMIN_ID  # noqa: E402  (грузит avito/bot/.env до и�
 import client as avito_client  # noqa: E402
 import sheets  # noqa: E402
 import telegram_api as tg  # noqa: E402
-from script_engine import classify_request, generate_variants  # noqa: E402
+from script_engine import TIME_RE, classify_request, generate_variants  # noqa: E402
 
 MSK = timezone(timedelta(hours=3))
 MAX_CHATS_TO_SCAN = 40
 AVITO_CHECK_INTERVAL = 60
-# 0 = один проход (локальный запуск); в GitHub Actions задаётся ~270 секунд
+# 0 = один проход (локальный запуск); на хостинге задаётся ~3300 секунд
 RUN_SECONDS = int(os.getenv("RUN_SECONDS", "0") or "0")
+
+HELP_TEXT = (
+    "Что я умею:\n"
+    "• Присылаю каждое новое сообщение с Avito с кнопками «✅ Отправить» / «❌ Исправить».\n"
+    "• Свободное время на сегодня — просто напишите часы: 15:00, 18:30\n"
+    "• Свой ответ клиенту — ответьте (reply) на карточку клиента.\n\n"
+    "Команды:\n"
+    "/status — работает ли бот, заявки за сегодня, что отправлено\n"
+    "/booked Имя | Телефон | Когда | Класс | chat_id — записать на пробный"
+)
+
+# Статистика процесса для /status (в памяти, сбрасывается при перезапуске)
+_stats = {"started": "", "host": "", "last_check": 0.0, "check_secs": 0.0, "avito_fails": 0, "errors": []}
+_variant_msgs = {}  # row_id -> message_id уже открытого экрана вариантов (чтобы не слать его повторно)
+
+
+def _now() -> str:
+    return datetime.now(MSK).strftime("%d.%m.%Y %H:%M:%S")
+
+
+def _hhmm() -> str:
+    return datetime.now(MSK).strftime("%H:%M")
 
 
 def today_str() -> str:
     return datetime.now(MSK).strftime("%d.%m.%Y")
 
 
+def _same_day(value: str, today: str) -> bool:
+    # Таблица может отдать "2.11.2026" вместо "02.11.2026" — сравниваем числа, а не строки
+    try:
+        return [int(p) for p in value.strip().split(".")] == [int(p) for p in today.split(".")]
+    except ValueError:
+        return False
+
+
 def today_slots() -> str:
     if not _same_day(sheets.get_state("slots_date", ""), today_str()):
         return ""
     return sheets.get_state("slots_text", "")
+
+
+def _note_error(where: str, err: str) -> None:
+    _stats["errors"] = (_stats["errors"] + [f"{_hhmm()} {where}: {err[:200]}"])[-5:]
+
+
+# ---------- карточки ----------
+
+def _card_text(v: dict) -> str:
+    return (
+        f"Новое сообщение на Avito\n"
+        f"От: {v['Имя']} ({v['Город']})\n"
+        f"Категория: {v['Категория']}\n"
+        f"Текст: {v['Сообщение клиента']}\n\n"
+        f"Черновик ответа:\n{v['Черновик ответа']}"
+    )
+
+
+def _sent_card_text(v: dict, sent_text: str) -> str:
+    return (
+        f"✅ ОТПРАВЛЕНО КЛИЕНТУ в {_hhmm()}\n\n"
+        f"{v['Имя']} ({v['Город']}) писал(а):\n{v['Сообщение клиента']}\n\n"
+        f"Ваш ответ:\n{sent_text}"
+    )
+
+
+def _card_buttons(row_id: str) -> dict:
+    return tg.inline_keyboard([("✅ Отправить", f"send:{row_id}"), ("❌ Исправить", f"edit:{row_id}")])
 
 
 # ---------- варианты ответа ----------
@@ -41,9 +99,9 @@ def _variants_for(row_id: str, values: dict) -> list[str]:
     return variants
 
 
-def _variant_screen(row_id: str, variants: list[str], idx: int) -> tuple[str, dict]:
+def _variant_screen(row_id: str, name: str, variants: list[str], idx: int) -> tuple[str, dict]:
     n = len(variants)
-    text = f"Вариант {idx + 1} из {n}:\n\n{variants[idx]}"
+    text = f"Ответ для {name} — вариант {idx + 1} из {n}:\n\n{variants[idx]}"
     markup = tg.keyboard_rows([
         [("◀️", f"nav:{row_id}:{(idx - 1) % n}"), (f"{idx + 1}/{n}", "noop"), ("▶️", f"nav:{row_id}:{(idx + 1) % n}")],
         [("✅ Отправить этот вариант", f"sv:{row_id}:{idx}")],
@@ -52,22 +110,49 @@ def _variant_screen(row_id: str, variants: list[str], idx: int) -> tuple[str, di
     return text, markup
 
 
-def _send_to_client(user_id: int, row_id: str, text: str, status: str) -> str:
+def _is_sent(v: dict) -> bool:
+    return v["Статус"].startswith("отправлено")
+
+
+def _send_to_client(user_id: int, row_id: str, text: str, status: str) -> bool:
+    """Отправляет клиенту и всегда явно сообщает Роману результат: карточка становится «✅ ОТПРАВЛЕНО» или приходит «❌ НЕ ОТПРАВЛЕНО»."""
     contact = sheets.get_contact_by_id(row_id)
     if not contact:
-        return "Не нашёл эту запись"
+        tg.send_message(ADMIN_ID, "❌ НЕ ОТПРАВЛЕНО: не нашёл эту заявку в таблице.")
+        return False
     v = contact["values"]
-    if v["Статус"].startswith("отправлено"):
-        return "Уже отправлено раньше"
+    if _is_sent(v):
+        tg.send_message(ADMIN_ID, f"Клиенту {v['Имя']} уже отправлено раньше — второй раз не отправляю.")
+        return False
     try:
         avito_client.send_message(user_id, v["chat_id"], text)
     except Exception as e:
-        sheets.update_contact_status(row_id, f"ошибка: {e}")
-        return "Ошибка отправки, смотри таблицу"
-    sheets.update_contact_status(row_id, status, new_draft=text)
+        _note_error("отправка в Avito", str(e))
+        tg.send_message(
+            ADMIN_ID,
+            f"❌ НЕ ОТПРАВЛЕНО клиенту {v['Имя']}.\nПричина: {str(e)[:200]}\n\n"
+            "Нажмите кнопку ещё раз через минуту или ответьте клиенту прямо в Avito.",
+        )
+        sheets.update_contact_status(row_id, f"ошибка: {str(e)[:100]}")
+        return False
+
+    # сначала показываем результат в Telegram, потом медленная запись в таблицу
     if v.get("telegram_msg_id"):
-        tg.edit_message_reply_markup(ADMIN_ID, int(v["telegram_msg_id"]), None)
-    return "Отправлено клиенту ✅"
+        try:
+            tg.edit_message_text(ADMIN_ID, int(v["telegram_msg_id"]), _sent_card_text(v, text), {"inline_keyboard": []})
+        except Exception:
+            tg.send_message(ADMIN_ID, _sent_card_text(v, text))
+    else:
+        tg.send_message(ADMIN_ID, _sent_card_text(v, text))
+    screen_id = _variant_msgs.pop(row_id, None)
+    if screen_id:
+        try:
+            tg.edit_message_text(ADMIN_ID, screen_id, f"✅ Отправлено клиенту {v['Имя']} — см. карточку выше.",
+                                 {"inline_keyboard": []})
+        except Exception:
+            pass
+    sheets.update_contact_status(row_id, status, new_draft=text)
+    return True
 
 
 # ---------- Telegram ----------
@@ -78,74 +163,59 @@ def handle_callback(user_id: int, cq: dict) -> None:
     chat_id = msg.get("chat", {}).get("id")
     message_id = msg.get("message_id")
 
-    if chat_id != ADMIN_ID:
+    if chat_id != ADMIN_ID or data == "noop":
         tg.answer_callback_query(cq["id"])
         return
 
-    if data == "noop":
+    action, _, rest = data.partition(":")
+    row_id = rest.split(":")[0]
+    contact = sheets.get_contact_by_id(row_id)  # из памяти — мгновенно
+    if not contact:
+        tg.answer_callback_query(cq["id"], "Не нашёл эту заявку")
+        return
+    v = contact["values"]
+
+    if action in ("send", "sv", "edit") and _is_sent(v):
+        tg.answer_callback_query(cq["id"], "Уже отправлено ✅")
+        return
+
+    if action == "send":
+        tg.answer_callback_query(cq["id"], "Отправляю клиенту…")
+        _send_to_client(user_id, row_id, v["Черновик ответа"], "отправлено")
+        return
+
+    if action == "edit":
+        if row_id in _variant_msgs:
+            tg.answer_callback_query(cq["id"], "Варианты уже открыты ниже ⬇️")
+            return
         tg.answer_callback_query(cq["id"])
+        variants = _variants_for(row_id, v)
+        text, markup = _variant_screen(row_id, v["Имя"], variants, 0)
+        sent = tg.send_message(ADMIN_ID, text, reply_markup=markup)
+        _variant_msgs[row_id] = sent.get("message_id")
         return
 
-    # Telegram ждёт ответа на нажатие ~15 с, а чтение таблицы бывает медленным — отвечаем сразу,
-    # иначе кнопка «висит» и кажется, что ничего не произошло. Для отправки ответ даём после результата.
-    if data.startswith(("edit:", "nav:", "own:")):
-        tg.answer_callback_query(cq["id"], "Загружаю варианты…" if data.startswith("edit:") else "")
-
-    if data.startswith("send:"):
-        row_id = data.split(":", 1)[1]
-        contact = sheets.get_contact_by_id(row_id)
-        if not contact:
-            tg.answer_callback_query(cq["id"], "Не нашёл эту запись")
-            return
-        result = _send_to_client(user_id, row_id, contact["values"]["Черновик ответа"], "отправлено")
-        tg.answer_callback_query(cq["id"], result)
-        return
-
-    if data.startswith("edit:"):
-        row_id = data.split(":", 1)[1]
-        contact = sheets.get_contact_by_id(row_id)
-        if not contact:
-            tg.send_message(ADMIN_ID, "Не нашёл эту запись")
-            return
-        variants = _variants_for(row_id, contact["values"])
-        text, markup = _variant_screen(row_id, variants, 0)
-        tg.send_message(ADMIN_ID, text, reply_markup=markup)
-        return
-
-    if data.startswith("nav:"):
-        _, row_id, idx = data.split(":")
-        # варианты уже сохранены при «Исправить» — таблицу обращений лишний раз не читаем
-        stored = sheets.get_state(f"var_{row_id}", "")
-        if stored:
-            variants = json.loads(stored)
-        else:
-            contact = sheets.get_contact_by_id(row_id)
-            if not contact:
-                tg.send_message(ADMIN_ID, "Не нашёл эту запись")
-                return
-            variants = _variants_for(row_id, contact["values"])
-        text, markup = _variant_screen(row_id, variants, int(idx))
+    if action == "nav":
+        tg.answer_callback_query(cq["id"])
+        idx = int(rest.split(":")[1])
+        variants = _variants_for(row_id, v)
+        text, markup = _variant_screen(row_id, v["Имя"], variants, idx)
         tg.edit_message_text(ADMIN_ID, message_id, text, markup)
+        _variant_msgs[row_id] = message_id
         return
 
-    if data.startswith("sv:"):
-        _, row_id, idx = data.split(":")
-        contact = sheets.get_contact_by_id(row_id)
-        if not contact:
-            tg.answer_callback_query(cq["id"], "Не нашёл эту запись")
-            return
-        variants = _variants_for(row_id, contact["values"])
-        chosen = variants[int(idx)]
-        result = _send_to_client(user_id, row_id, chosen, f"отправлено (вариант {int(idx) + 1})")
-        tg.answer_callback_query(cq["id"], result)
-        if result.startswith("Отправлено"):
-            tg.edit_message_text(ADMIN_ID, message_id, f"Отправлено клиенту ✅\n\n{chosen}", {"inline_keyboard": []})
+    if action == "sv":
+        tg.answer_callback_query(cq["id"], "Отправляю клиенту…")
+        idx = int(rest.split(":")[1])
+        chosen = _variants_for(row_id, v)[idx]
+        _variant_msgs[row_id] = message_id
+        _send_to_client(user_id, row_id, chosen, f"отправлено (вариант {idx + 1})")
         return
 
-    if data.startswith("own:"):
-        row_id = data.split(":", 1)[1]
+    if action == "own":
+        tg.answer_callback_query(cq["id"])
         prompt = tg.send_message(
-            ADMIN_ID, "Напишите свой текст ответом (reply) на ЭТО сообщение — отправлю его клиенту."
+            ADMIN_ID, f"Напишите свой текст для {v['Имя']} ответом (reply) на ЭТО сообщение — отправлю его клиенту."
         )
         sheets.set_state(f"reply_{prompt.get('message_id')}", row_id)
         return
@@ -153,11 +223,60 @@ def handle_callback(user_id: int, cq: dict) -> None:
     tg.answer_callback_query(cq["id"])
 
 
+def status_text() -> str:
+    lines = []
+    ago = int(time.time() - _stats["last_check"]) if _stats["last_check"] else None
+    healthy = ago is not None and ago < 5 * 60 and _stats["avito_fails"] == 0
+    lines.append(("🟢 Бот работает" if healthy else "🟠 Бот запущен, но есть проблемы") + f" · {_stats['host']}")
+    lines.append(f"Запущен: {_stats['started'][11:16]}")
+    if ago is None:
+        lines.append("Avito ещё не проверялся после запуска")
+    else:
+        lines.append(f"Avito проверен {ago} с назад (проверка заняла {_stats['check_secs']:.1f} с)")
+    slots = today_slots()
+    lines.append(f"Свободное время сегодня: {slots}" if slots else "Свободное время на сегодня не указано — пришлите часы, например 15:00, 18:30")
+
+    today = today_str()
+    todays = [c for c in sheets.all_contacts() if _same_day(c["Дата"], today) and c["Имя"] != "—"]
+    lines.append("")
+    lines.append(f"Заявки за сегодня: {len(todays)}")
+    for c in todays:
+        mark = "✅" if _is_sent(c) else ("❌" if c["Статус"].startswith("ошибка") else "⏳")
+        lines.append(f"{mark} {c['Время']} {c['Имя']} ({c['Город']}) — {c['Статус']}")
+    waiting = [c for c in sheets.all_contacts() if c["Статус"] == "ожидает" and not _same_day(c["Дата"], today)]
+    if waiting:
+        lines.append(f"\nЕщё ждут ответа с прошлых дней: {len(waiting)}")
+        for c in waiting[-5:]:
+            lines.append(f"⏳ {c['Дата']} {c['Имя']} ({c['Город']})")
+
+    lines.append("")
+    if _stats["errors"]:
+        lines.append("⚠️ Последние ошибки:")
+        lines.extend(_stats["errors"])
+    else:
+        lines.append("Ошибок нет")
+    return "\n".join(lines)
+
+
+def _save_slots(text: str) -> None:
+    sheets.set_state("slots_text", text)
+    sheets.set_state("slots_date", today_str())
+    tg.send_message(ADMIN_ID, f"Принял свободное время на сегодня: {text}\nБуду предлагать клиентам эти часы.")
+
+
 def handle_message(user_id: int, msg: dict) -> None:
     if msg.get("chat", {}).get("id") != ADMIN_ID:
         return
     text = (msg.get("text") or "").strip()
-    if not text or text == "/start":
+    if not text:
+        return
+
+    if text in ("/start", "/help"):
+        tg.send_message(ADMIN_ID, HELP_TEXT)
+        return
+
+    if text.startswith("/status"):
+        tg.send_message(ADMIN_ID, status_text())
         return
 
     if text.startswith("/booked"):
@@ -171,17 +290,22 @@ def handle_message(user_id: int, msg: dict) -> None:
     reply_to = msg.get("reply_to_message")
     if reply_to:
         replied_id = reply_to.get("message_id")
+        if str(replied_id) == sheets.get_state("slots_prompt_msg_id", ""):
+            _save_slots(text)
+            return
         row_id = sheets.find_row_id_by_telegram_msg_id(replied_id) or sheets.get_state(f"reply_{replied_id}", "")
         if not row_id:
-            tg.send_message(ADMIN_ID, "Не нашёл, к какому обращению это относится.")
+            tg.send_message(ADMIN_ID, "Не понял, к какой заявке это ответ. Ответьте (reply) на карточку клиента.")
             return
-        result = _send_to_client(user_id, row_id, text, "отправлено (свой текст)")
-        tg.send_message(ADMIN_ID, result)
+        tg.send_message(ADMIN_ID, "Отправляю клиенту…")
+        _send_to_client(user_id, row_id, text, "отправлено (свой текст)")
         return
 
-    sheets.set_state("slots_text", text)
-    sheets.set_state("slots_date", today_str())
-    tg.send_message(ADMIN_ID, f"Принял свободное время на сегодня: {text}")
+    # обычный текст считаем свободным временем, только если в нём есть часы — иначе случайная фраза затрёт слоты
+    if TIME_RE.search(text):
+        _save_slots(text)
+        return
+    tg.send_message(ADMIN_ID, "Не понял сообщение 🙂\n\n" + HELP_TEXT)
 
 
 def process_telegram_updates(user_id: int, offset: int, timeout: int) -> int:
@@ -198,6 +322,7 @@ def process_telegram_updates(user_id: int, offset: int, timeout: int) -> int:
             print("ERROR handling update:", traceback.format_exc())
             # лог на хостинге не виден снаружи — оставляем след в таблице и предупреждаем Романа
             what = upd.get("callback_query", {}).get("data") or "сообщение"
+            _note_error(f"кнопка {what}", str(e))
             try:
                 sheets.set_state("last_update_error", f"{_now()} [{what}] {traceback.format_exc()[-1500:]}")
                 tg.send_message(ADMIN_ID, f"⚠️ Не получилось обработать нажатие ({what}): {e}")
@@ -209,14 +334,6 @@ def process_telegram_updates(user_id: int, offset: int, timeout: int) -> int:
 
 
 # ---------- Avito ----------
-
-def _same_day(value: str, today: str) -> bool:
-    # Таблица может отдать "2.11.2026" вместо "02.11.2026" — сравниваем числа, а не строки
-    try:
-        return [int(p) for p in value.strip().split(".")] == [int(p) for p in today.split(".")]
-    except ValueError:
-        return False
-
 
 _asked_today = ""  # страховка внутри процесса: даже если таблица подведёт, спросим не чаще раза в день
 
@@ -232,12 +349,13 @@ def maybe_ask_daily_slots() -> None:
     if datetime.now(MSK).hour < 9:
         return
     _asked_today = today
-    tg.send_message(
+    prompt = tg.send_message(
         ADMIN_ID,
         "Доброе утро! Какое время сегодня свободно для пробных уроков?\n"
         "Напишите через запятую, например: 15:00, 18:30",
     )
     sheets.set_state("slots_prompt_date", today)
+    sheets.set_state("slots_prompt_msg_id", str(prompt.get("message_id", "")))
 
 
 def check_new_avito_messages(user_id: int) -> None:
@@ -270,37 +388,42 @@ def check_new_avito_messages(user_id: int) -> None:
         variants = generate_variants(name, client_text, slots_text)
         draft = variants[0]
 
-        notif_text = (
-            f"Новое сообщение на Avito\n"
-            f"От: {name} ({city})\n"
-            f"Категория: {category}\n"
-            f"Текст: {client_text}\n\n"
-            f"Черновик ответа:\n{draft}"
-        )
-        sent = tg.send_message(ADMIN_ID, notif_text)
-        telegram_msg_id = sent.get("message_id")
+        # карточка уходит с кнопками сразу, а запись в таблицу — после
+        row_id = sheets.new_row_id()
+        card = {"Имя": name, "Город": city, "Категория": category, "Сообщение клиента": client_text,
+                "Черновик ответа": draft}
+        sent = tg.send_message(ADMIN_ID, _card_text(card), reply_markup=_card_buttons(row_id))
         print(f"NEW_MESSAGE: {name} ({city}) -> notified")
-
-        row_id = sheets.log_contact(chat["id"], avito_msg_id, name, city, category, client_text, draft, telegram_msg_id)
+        sheets.log_contact(chat["id"], avito_msg_id, name, city, category, client_text, draft,
+                           sent.get("message_id"), row_id=row_id)
         sheets.set_state(f"var_{row_id}", json.dumps(variants, ensure_ascii=False))
         seen_ids.add(avito_msg_id)
-
-        tg.edit_message_reply_markup(
-            ADMIN_ID, telegram_msg_id, tg.inline_keyboard([
-                ("✅ Отправить", f"send:{row_id}"),
-                ("❌ Исправить", f"edit:{row_id}"),
-            ])
-        )
 
     if not bootstrapped:
         sheets.set_state("bootstrapped", "1")
 
 
+def _run_avito_check(user_id: int) -> None:
+    t = time.time()
+    try:
+        maybe_ask_daily_slots()
+        check_new_avito_messages(user_id)
+    except Exception as e:
+        print("ERROR avito check:", traceback.format_exc())
+        _note_error("проверка Avito", str(e))
+        _stats["avito_fails"] += 1
+        if _stats["avito_fails"] == 3:  # одно предупреждение, а не каждую минуту
+            tg.send_message(ADMIN_ID, f"⚠️ Уже 3 раза подряд не получается проверить Avito: {str(e)[:200]}")
+        return
+    if _stats["avito_fails"] >= 3:
+        tg.send_message(ADMIN_ID, "✅ Проверка Avito снова работает.")
+    _stats["avito_fails"] = 0
+    _stats["last_check"] = time.time()
+    _stats["check_secs"] = time.time() - t
+    sheets.set_state("last_alive", f"{_now()} ({_stats['host']})")
+
+
 # ---------- главный цикл ----------
-
-def _now() -> str:
-    return datetime.now(MSK).strftime("%d.%m.%Y %H:%M:%S")
-
 
 def _code_signature() -> tuple:
     here = os.path.dirname(os.path.abspath(__file__))
@@ -311,8 +434,11 @@ def _code_signature() -> tuple:
 
 def main() -> None:
     host = os.uname().nodename if hasattr(os, "uname") else "local"
+    _stats["host"] = "хостинг reg.ru" if "reg.ru" in host else host
+    _stats["started"] = _now()
     sheets.set_state("last_start", f"{_now()} ({host})")
     user_id = avito_client.get_self_account()["id"]
+    sheets.get_logged_msg_ids()  # прогреваем кэш таблицы до первых нажатий
     sheets.set_state("last_run", f"{_now()} ({host})")
     offset = int(sheets.get_state("telegram_last_update_id", "0") or "0")
     deadline = time.time() + RUN_SECONDS
@@ -328,18 +454,19 @@ def main() -> None:
             print("Код обновился — завершаюсь, cron перезапустит с новой версией")
             break
         remaining = deadline - time.time()
+        # к следующей проверке Avito просыпаемся вовремя, но нажатия кнопок long-poll отдаёт мгновенно
+        until_check = AVITO_CHECK_INTERVAL - (time.time() - last_avito_check)
         try:
-            poll_timeout = int(max(0, min(25, remaining))) if RUN_SECONDS else 0
+            poll_timeout = int(max(0, min(25, remaining, until_check))) if RUN_SECONDS else 0
             offset = process_telegram_updates(user_id, offset, poll_timeout)
-
-            if time.time() - last_avito_check >= AVITO_CHECK_INTERVAL:
-                maybe_ask_daily_slots()
-                check_new_avito_messages(user_id)
-                last_avito_check = time.time()
-                sheets.set_state("last_alive", f"{_now()} ({host})")
-        except Exception:
-            print("ERROR in cycle:", traceback.format_exc())
+        except Exception as e:
+            print("ERROR telegram poll:", traceback.format_exc())
+            _note_error("Telegram", str(e))
             time.sleep(5)
+
+        if time.time() - last_avito_check >= AVITO_CHECK_INTERVAL:
+            _run_avito_check(user_id)
+            last_avito_check = time.time()
 
         if time.time() >= deadline:
             break

@@ -64,7 +64,7 @@ def _headers() -> dict:
 
 
 def get_self_account() -> dict:
-    resp = requests.get(f"{BASE_URL}/core/v1/accounts/self", headers=_headers())
+    resp = requests.get(f"{BASE_URL}/core/v1/accounts/self", headers=_headers(), timeout=20)
     resp.raise_for_status()
     return resp.json()
 
@@ -74,6 +74,7 @@ def get_chats(user_id: int, limit: int = 100, offset: int = 0) -> dict:
         f"{BASE_URL}/messenger/v2/accounts/{user_id}/chats",
         headers=_headers(),
         params={"limit": limit, "offset": offset},
+        timeout=20,
     )
     resp.raise_for_status()
     return resp.json()
@@ -84,6 +85,7 @@ def get_messages(user_id: int, chat_id: str, limit: int = 100, offset: int = 0) 
         f"{BASE_URL}/messenger/v3/accounts/{user_id}/chats/{chat_id}/messages",
         headers=_headers(),
         params={"limit": limit, "offset": offset},
+        timeout=20,
     )
     resp.raise_for_status()
     return resp.json()
@@ -110,6 +112,7 @@ def send_message(user_id: int, chat_id: str, text: str) -> dict:
         f"{BASE_URL}/messenger/v1/accounts/{user_id}/chats/{chat_id}/messages",
         headers=_headers(),
         json={"message": {"text": text}, "type": "text"},
+        timeout=20,
     )
     resp.raise_for_status()
     return resp.json()
