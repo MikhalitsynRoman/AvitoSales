@@ -270,6 +270,7 @@ def check_new_avito_messages(user_id: int) -> None:
 
 def main() -> None:
     user_id = avito_client.get_self_account()["id"]
+    sheets.set_state("last_run", datetime.now(MSK).strftime("%d.%m.%Y %H:%M:%S") + f" ({os.uname().nodename if hasattr(os, 'uname') else 'local'})")
     offset = int(sheets.get_state("telegram_last_update_id", "0") or "0")
     deadline = time.time() + RUN_SECONDS
     last_avito_check = 0.0
