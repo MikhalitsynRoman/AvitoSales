@@ -268,9 +268,15 @@ def check_new_avito_messages(user_id: int) -> None:
 
 # ---------- главный цикл ----------
 
+def _now() -> str:
+    return datetime.now(MSK).strftime("%d.%m.%Y %H:%M:%S")
+
+
 def main() -> None:
+    host = os.uname().nodename if hasattr(os, "uname") else "local"
+    sheets.set_state("last_start", f"{_now()} ({host})")
     user_id = avito_client.get_self_account()["id"]
-    sheets.set_state("last_run", datetime.now(MSK).strftime("%d.%m.%Y %H:%M:%S") + f" ({os.uname().nodename if hasattr(os, 'uname') else 'local'})")
+    sheets.set_state("last_run", f"{_now()} ({host})")
     offset = int(sheets.get_state("telegram_last_update_id", "0") or "0")
     deadline = time.time() + RUN_SECONDS
     until_second = os.getenv("RUN_UNTIL_SECOND")
@@ -295,7 +301,17 @@ def main() -> None:
 
         if time.time() >= deadline:
             break
+    sheets.set_state("last_end", _now())
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception:
+        err = traceback.format_exc()
+        print("ERROR fatal:", err)
+        try:
+            sheets.set_state("last_error", f"{_now()}: {err[-600:]}")
+        except Exception:
+            pass
+        raise
