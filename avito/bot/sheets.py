@@ -155,6 +155,16 @@ def find_row_id_by_telegram_msg_id(telegram_msg_id: int) -> str | None:
     return None
 
 
+def mark_status_cached(row_id: str, status: str, new_draft: str | None = None) -> None:
+    """Только в памяти и мгновенно; в таблицу затем пишет update_contact_status."""
+    found = get_contact_by_id(row_id)
+    if found:
+        cached = _load_contacts()[found["row"]]
+        cached[_IDX["Статус"]] = status
+        if new_draft is not None:
+            cached[_IDX["Черновик ответа"]] = new_draft
+
+
 def update_contact_status(row_id: str, status: str, new_draft: str | None = None) -> None:
     found = get_contact_by_id(row_id)
     if not found:

@@ -60,8 +60,8 @@ def today_slots() -> str:
     return sheets.get_state("slots_text", "")
 
 
-def _note_error(where: str, err: str) -> None:
-    _stats["errors"] = (_stats["errors"] + [f"{_hhmm()} {where}: {err[:200]}"])[-5:]
+def _note_error(where: str, err) -> None:
+    _stats["errors"] = (_stats["errors"] + [f"{_hhmm()} {where}: {tg.clean_error(err)[:200]}"])[-5:]
 
 
 # ---------- карточки ----------
@@ -127,16 +127,26 @@ def _send_to_client(user_id: int, row_id: str, text: str, status: str) -> bool:
     try:
         avito_client.send_message(user_id, v["chat_id"], text)
     except Exception as e:
-        _note_error("отправка в Avito", str(e))
+        _note_error("отправка в Avito", e)
+        sheets.update_contact_status(row_id, f"ошибка: {str(e)[:100]}")
         tg.send_message(
             ADMIN_ID,
             f"❌ НЕ ОТПРАВЛЕНО клиенту {v['Имя']}.\nПричина: {str(e)[:200]}\n\n"
             "Нажмите кнопку ещё раз через минуту или ответьте клиенту прямо в Avito.",
         )
-        sheets.update_contact_status(row_id, f"ошибка: {str(e)[:100]}")
         return False
 
-    # сначала показываем результат в Telegram, потом медленная запись в таблицу
+    # клиент уже получил сообщение: сразу помечаем это в памяти, чтобы повторное нажатие не отправило второй раз,
+    # даже если Telegram сейчас недоступен. Затем показываем результат, затем медленная запись в таблицу.
+    sheets.mark_status_cached(row_id, status, text)
+    try:
+        _show_sent(row_id, v, text)
+    finally:
+        sheets.update_contact_status(row_id, status, new_draft=text)
+    return True
+
+
+def _show_sent(row_id: str, v: dict, text: str) -> None:
     if v.get("telegram_msg_id"):
         try:
             tg.edit_message_text(ADMIN_ID, int(v["telegram_msg_id"]), _sent_card_text(v, text), {"inline_keyboard": []})
@@ -151,8 +161,6 @@ def _send_to_client(user_id: int, row_id: str, text: str, status: str) -> bool:
                                  {"inline_keyboard": []})
         except Exception:
             pass
-    sheets.update_contact_status(row_id, status, new_draft=text)
-    return True
 
 
 # ---------- Telegram ----------
@@ -249,7 +257,10 @@ def status_text() -> str:
         for c in waiting[-5:]:
             lines.append(f"⏳ {c['Дата']} {c['Имя']} ({c['Город']})")
 
+    s = tg.stats
     lines.append("")
+    lines.append(f"Связь с Telegram: запросов {s['calls']}, не прошло {s['fails']}, медленных (>3 с) {s['slow']}, "
+                 f"самый долгий {s['max_secs']:.1f} с")
     if _stats["errors"]:
         lines.append("⚠️ Последние ошибки:")
         lines.extend(_stats["errors"])
@@ -326,13 +337,14 @@ def process_telegram_updates(user_id: int, offset: int, timeout: int) -> int:
                 handle_message(user_id, upd["message"])
             sheets.set_state("last_update", f"{_now()} {what} → обработано")
         except Exception as e:
-            print("ERROR handling update:", traceback.format_exc())
+            print("ERROR handling update:", tg.clean_error(traceback.format_exc()))
             # лог на хостинге не виден снаружи — оставляем след в таблице и предупреждаем Романа
-            what = upd.get("callback_query", {}).get("data") or "сообщение"
-            _note_error(f"кнопка {what}", str(e))
+            _note_error(what, e)
             try:
-                sheets.set_state("last_update_error", f"{_now()} [{what}] {traceback.format_exc()[-1500:]}")
-                tg.send_message(ADMIN_ID, f"⚠️ Не получилось обработать нажатие ({what}): {e}")
+                sheets.set_state("last_update_error",
+                                 f"{_now()} [{what}] {tg.clean_error(traceback.format_exc())[-1500:]}")
+                tg.send_message(ADMIN_ID, f"⚠️ Не получилось обработать ({what}): {tg.clean_error(e)[:200]}\n"
+                                          "Попробуйте нажать ещё раз.")
             except Exception:
                 pass
     if new_offset != offset:
@@ -417,10 +429,13 @@ def _run_avito_check(user_id: int) -> None:
         check_new_avito_messages(user_id)
     except Exception as e:
         print("ERROR avito check:", traceback.format_exc())
-        _note_error("проверка Avito", str(e))
+        _note_error("проверка Avito", e)
         _stats["avito_fails"] += 1
         if _stats["avito_fails"] == 3:  # одно предупреждение, а не каждую минуту
-            tg.send_message(ADMIN_ID, f"⚠️ Уже 3 раза подряд не получается проверить Avito: {str(e)[:200]}")
+            try:
+                tg.send_message(ADMIN_ID, f"⚠️ Уже 3 раза подряд не получается проверить Avito: {tg.clean_error(e)[:200]}")
+            except Exception:
+                pass
         return
     if _stats["avito_fails"] >= 3:
         tg.send_message(ADMIN_ID, "✅ Проверка Avito снова работает.")
@@ -439,8 +454,23 @@ def _code_signature() -> tuple:
     return tuple(sorted((f, os.path.getmtime(f)) for f in files if os.path.exists(f)))
 
 
+def _telegram_diag() -> str:
+    """Сколько занимает установка соединения с api.telegram.org с этой машины (по IPv4)."""
+    import socket
+    parts = []
+    for _ in range(3):
+        t = time.time()
+        try:
+            socket.create_connection(("api.telegram.org", 443), timeout=10).close()
+            parts.append(f"{time.time() - t:.2f}с")
+        except OSError as e:
+            parts.append(f"ошибка за {time.time() - t:.1f}с ({e.__class__.__name__})")
+    return ", ".join(parts)
+
+
 def main() -> None:
     host = os.uname().nodename if hasattr(os, "uname") else "local"
+    sheets.set_state("tg_diag", f"{_now()} соединение с Telegram: {_telegram_diag()}")
     _stats["host"] = "хостинг reg.ru" if "reg.ru" in host else host
     _stats["started"] = _now()
     sheets.set_state("last_start", f"{_now()} ({host})")
@@ -467,9 +497,9 @@ def main() -> None:
             poll_timeout = int(max(0, min(25, remaining, until_check))) if RUN_SECONDS else 0
             offset = process_telegram_updates(user_id, offset, poll_timeout)
         except Exception as e:
-            print("ERROR telegram poll:", traceback.format_exc())
-            _note_error("Telegram", str(e))
-            time.sleep(5)
+            print("ERROR telegram poll:", tg.clean_error(traceback.format_exc()))
+            _note_error("Telegram", e)
+            time.sleep(2)
 
         if time.time() - last_avito_check >= AVITO_CHECK_INTERVAL:
             _run_avito_check(user_id)
@@ -484,7 +514,7 @@ if __name__ == "__main__":
     try:
         main()
     except Exception:
-        err = traceback.format_exc()
+        err = tg.clean_error(traceback.format_exc())
         print("ERROR fatal:", err)
         try:
             sheets.set_state("last_error", f"{_now()}: {err[-600:]}")
