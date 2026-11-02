@@ -86,6 +86,11 @@ def handle_callback(user_id: int, cq: dict) -> None:
         tg.answer_callback_query(cq["id"])
         return
 
+    # Telegram ждёт ответа на нажатие ~15 с, а чтение таблицы бывает медленным — отвечаем сразу,
+    # иначе кнопка «висит» и кажется, что ничего не произошло. Для отправки ответ даём после результата.
+    if data.startswith(("edit:", "nav:", "own:")):
+        tg.answer_callback_query(cq["id"], "Загружаю варианты…" if data.startswith("edit:") else "")
+
     if data.startswith("send:"):
         row_id = data.split(":", 1)[1]
         contact = sheets.get_contact_by_id(row_id)
@@ -100,24 +105,27 @@ def handle_callback(user_id: int, cq: dict) -> None:
         row_id = data.split(":", 1)[1]
         contact = sheets.get_contact_by_id(row_id)
         if not contact:
-            tg.answer_callback_query(cq["id"], "Не нашёл эту запись")
+            tg.send_message(ADMIN_ID, "Не нашёл эту запись")
             return
         variants = _variants_for(row_id, contact["values"])
         text, markup = _variant_screen(row_id, variants, 0)
         tg.send_message(ADMIN_ID, text, reply_markup=markup)
-        tg.answer_callback_query(cq["id"])
         return
 
     if data.startswith("nav:"):
         _, row_id, idx = data.split(":")
-        contact = sheets.get_contact_by_id(row_id)
-        if not contact:
-            tg.answer_callback_query(cq["id"], "Не нашёл эту запись")
-            return
-        variants = _variants_for(row_id, contact["values"])
+        # варианты уже сохранены при «Исправить» — таблицу обращений лишний раз не читаем
+        stored = sheets.get_state(f"var_{row_id}", "")
+        if stored:
+            variants = json.loads(stored)
+        else:
+            contact = sheets.get_contact_by_id(row_id)
+            if not contact:
+                tg.send_message(ADMIN_ID, "Не нашёл эту запись")
+                return
+            variants = _variants_for(row_id, contact["values"])
         text, markup = _variant_screen(row_id, variants, int(idx))
         tg.edit_message_text(ADMIN_ID, message_id, text, markup)
-        tg.answer_callback_query(cq["id"])
         return
 
     if data.startswith("sv:"):
@@ -140,7 +148,6 @@ def handle_callback(user_id: int, cq: dict) -> None:
             ADMIN_ID, "Напишите свой текст ответом (reply) на ЭТО сообщение — отправлю его клиенту."
         )
         sheets.set_state(f"reply_{prompt.get('message_id')}", row_id)
-        tg.answer_callback_query(cq["id"])
         return
 
     tg.answer_callback_query(cq["id"])
@@ -187,8 +194,15 @@ def process_telegram_updates(user_id: int, offset: int, timeout: int) -> int:
                 handle_callback(user_id, upd["callback_query"])
             elif "message" in upd:
                 handle_message(user_id, upd["message"])
-        except Exception:
+        except Exception as e:
             print("ERROR handling update:", traceback.format_exc())
+            # лог на хостинге не виден снаружи — оставляем след в таблице и предупреждаем Романа
+            what = upd.get("callback_query", {}).get("data") or "сообщение"
+            try:
+                sheets.set_state("last_update_error", f"{_now()} [{what}] {traceback.format_exc()[-1500:]}")
+                tg.send_message(ADMIN_ID, f"⚠️ Не получилось обработать нажатие ({what}): {e}")
+            except Exception:
+                pass
     if new_offset != offset:
         sheets.set_state("telegram_last_update_id", str(new_offset))
     return new_offset

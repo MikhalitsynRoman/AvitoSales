@@ -43,7 +43,10 @@ def edit_message_text(chat_id: int, message_id: int, text: str, reply_markup: di
     payload = {"chat_id": chat_id, "message_id": message_id, "text": text}
     if reply_markup is not None:
         payload["reply_markup"] = reply_markup
-    requests.post(f"{API}/editMessageText", json=payload, timeout=15)
+    resp = requests.post(f"{API}/editMessageText", json=payload, timeout=15)
+    # "message is not modified" — безобидно (тот же вариант нажат повторно), остальное показываем
+    if not resp.ok and "not modified" not in resp.text:
+        raise RuntimeError(f"editMessageText: {resp.text[:200]}")
 
 
 def inline_keyboard(buttons: list[tuple[str, str]]) -> dict:
