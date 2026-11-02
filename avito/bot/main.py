@@ -458,14 +458,21 @@ def _telegram_diag() -> str:
     """Сколько занимает установка соединения с api.telegram.org с этой машины (по IPv4)."""
     import socket
     parts = []
-    for _ in range(3):
-        t = time.time()
-        try:
-            socket.create_connection(("api.telegram.org", 443), timeout=10).close()
-            parts.append(f"{time.time() - t:.2f}с")
-        except OSError as e:
-            parts.append(f"ошибка за {time.time() - t:.1f}с ({e.__class__.__name__})")
-    return ", ".join(parts)
+    addrs = sorted({(a[0], a[4][0]) for a in socket.getaddrinfo("api.telegram.org", 443, type=socket.SOCK_STREAM)})
+    for family, ip in addrs:
+        res = []
+        for _ in range(3):
+            t = time.time()
+            try:
+                s = socket.socket(family, socket.SOCK_STREAM)
+                s.settimeout(5)
+                s.connect((ip, 443))
+                s.close()
+                res.append(f"{time.time() - t:.2f}с")
+            except OSError as e:
+                res.append(f"нет за {time.time() - t:.0f}с ({e.__class__.__name__})")
+        parts.append(f"{ip}: {', '.join(res)}")
+    return "; ".join(parts)
 
 
 def main() -> None:
