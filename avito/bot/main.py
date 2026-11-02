@@ -25,7 +25,7 @@ def today_str() -> str:
 
 
 def today_slots() -> str:
-    if sheets.get_state("slots_date", "") != today_str():
+    if not _same_day(sheets.get_state("slots_date", ""), today_str()):
         return ""
     return sheets.get_state("slots_text", "")
 
@@ -196,12 +196,28 @@ def process_telegram_updates(user_id: int, offset: int, timeout: int) -> int:
 
 # ---------- Avito ----------
 
+def _same_day(value: str, today: str) -> bool:
+    # Таблица может отдать "2.11.2026" вместо "02.11.2026" — сравниваем числа, а не строки
+    try:
+        return [int(p) for p in value.strip().split(".")] == [int(p) for p in today.split(".")]
+    except ValueError:
+        return False
+
+
+_asked_today = ""  # страховка внутри процесса: даже если таблица подведёт, спросим не чаще раза в день
+
+
 def maybe_ask_daily_slots() -> None:
+    global _asked_today
     today = today_str()
-    if sheets.get_state("slots_prompt_date", "") == today:
+    if _asked_today == today:
+        return
+    if _same_day(sheets.get_state("slots_prompt_date", ""), today) or _same_day(sheets.get_state("slots_date", ""), today):
+        _asked_today = today
         return
     if datetime.now(MSK).hour < 9:
         return
+    _asked_today = today
     tg.send_message(
         ADMIN_ID,
         "Доброе утро! Какое время сегодня свободно для пробных уроков?\n"
