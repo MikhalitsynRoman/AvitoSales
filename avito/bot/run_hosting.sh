@@ -1,5 +1,6 @@
 #!/bin/sh
-# Запускается cron'ом на хостинге reg.ru раз в минуту; запуск живёт ~40 с + старт, чтобы уложиться в минуту.
+# Cron на хостинге reg.ru вызывает это раз в минуту. Бот работает одним процессом ~55 минут;
+# flock не даёт запустить второй экземпляр, а если процесс упал — следующий вызов поднимет его в течение минуты.
 APP="$HOME/AvitoSales"
 LOG="$HOME/avito_bot.log"
 
@@ -8,4 +9,4 @@ if [ -f "$LOG" ] && [ "$(stat -c%s "$LOG")" -gt 2000000 ]; then
 fi
 
 cd "$APP" || exit 1
-RUN_SECONDS=40 RUN_UNTIL_SECOND=52 exec flock -n "$HOME/.avito_bot.lock" "$APP/.venv/bin/python" avito/bot/main.py >> "$LOG" 2>&1
+RUN_SECONDS=3300 exec flock -n "$HOME/.avito_bot.lock" "$APP/.venv/bin/python" avito/bot/main.py >> "$LOG" 2>&1

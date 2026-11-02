@@ -295,6 +295,7 @@ def main() -> None:
                 maybe_ask_daily_slots()
                 check_new_avito_messages(user_id)
                 last_avito_check = time.time()
+                sheets.set_state("last_alive", f"{_now()} ({host})")
         except Exception:
             print("ERROR in cycle:", traceback.format_exc())
             time.sleep(5)
