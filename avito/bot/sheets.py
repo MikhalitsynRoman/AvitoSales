@@ -34,6 +34,13 @@ def _client():
 
 _sheet_cache = {}
 
+# RAW: иначе Google превращает "02.11.2026" в дату и бот перестаёт узнавать сегодняшний день
+RAW = "RAW"
+
+
+def _set_cell(sheet, row: int, col: int, value: str) -> None:
+    sheet.update(values=[[value]], range_name=gspread.utils.rowcol_to_a1(row, col), value_input_option=RAW)
+
 
 def _get_or_create_sheet(spreadsheet, name: str, headers: list):
     if name in _sheet_cache:
@@ -92,7 +99,7 @@ def log_contact(chat_id: str, avito_msg_id: str, name: str, city: str, category:
     row[_IDX["chat_id"]] = chat_id
     row[_IDX["avito_msg_id"]] = avito_msg_id
     row[_IDX["telegram_msg_id"]] = str(telegram_msg_id or "")
-    sheet.append_row(row)
+    sheet.append_row(row, value_input_option=RAW)
     return row_id
 
 
@@ -126,15 +133,15 @@ def update_contact_status(row_id: str, status: str, new_draft: str | None = None
     if not found:
         return
     row = found["row"]
-    sheet.update_cell(row, CONTACTS_HEADERS.index("Статус") + 1, status)
+    _set_cell(sheet, row, CONTACTS_HEADERS.index("Статус") + 1, status)
     if new_draft is not None:
-        sheet.update_cell(row, CONTACTS_HEADERS.index("Черновик ответа") + 1, new_draft)
+        _set_cell(sheet, row, CONTACTS_HEADERS.index("Черновик ответа") + 1, new_draft)
 
 
 def log_booking(name: str, phone: str, chat_id: str, when: str, goal: str) -> None:
     ss = _spreadsheet()
     sheet = _get_or_create_sheet(ss, BOOKINGS_SHEET, BOOKINGS_HEADERS)
-    sheet.append_row([
+    sheet.append_row(value_input_option=RAW, values=[
         datetime.now().strftime("%d.%m.%Y %H:%M"), name or "—", phone or "—", chat_id, when or "—", goal or "—",
     ])
 
@@ -155,6 +162,6 @@ def set_state(key: str, value: str) -> None:
     rows = sheet.get_all_values()
     for i, r in enumerate(rows[1:], start=2):
         if r and r[0] == key:
-            sheet.update_cell(i, 2, value)
+            _set_cell(sheet, i, 2, value)
             return
-    sheet.append_row([key, value])
+    sheet.append_row([key, value], value_input_option=RAW)

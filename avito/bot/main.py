@@ -272,6 +272,13 @@ def _now() -> str:
     return datetime.now(MSK).strftime("%d.%m.%Y %H:%M:%S")
 
 
+def _code_signature() -> tuple:
+    here = os.path.dirname(os.path.abspath(__file__))
+    files = [os.path.join(here, f) for f in os.listdir(here) if f.endswith(".py")]
+    files.append(os.path.join(here, "..", "client.py"))
+    return tuple(sorted((f, os.path.getmtime(f)) for f in files if os.path.exists(f)))
+
+
 def main() -> None:
     host = os.uname().nodename if hasattr(os, "uname") else "local"
     sheets.set_state("last_start", f"{_now()} ({host})")
@@ -284,8 +291,12 @@ def main() -> None:
         now = time.time()
         deadline = max(now - now % 60 + int(until_second), now + 5)
     last_avito_check = 0.0
+    code_sig = _code_signature()
 
     while True:
+        if RUN_SECONDS and _code_signature() != code_sig:
+            print("Код обновился — завершаюсь, cron перезапустит с новой версией")
+            break
         remaining = deadline - time.time()
         try:
             poll_timeout = int(max(0, min(25, remaining))) if RUN_SECONDS else 0
