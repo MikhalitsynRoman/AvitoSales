@@ -7,10 +7,10 @@ from datetime import datetime, timedelta, timezone
 
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 
+from config import ADMIN_ID  # noqa: E402  (грузит avito/bot/.env до импорта клиента Avito)
 import client as avito_client  # noqa: E402
 import sheets  # noqa: E402
 import telegram_api as tg  # noqa: E402
-from config import ADMIN_ID  # noqa: E402
 from script_engine import classify_request, generate_variants  # noqa: E402
 
 MSK = timezone(timedelta(hours=3))

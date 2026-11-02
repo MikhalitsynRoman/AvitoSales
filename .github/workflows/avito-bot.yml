@@ -1,8 +1,7 @@
 name: avito-bot
 
+# Основной запуск теперь на хостинге reg.ru (avito/bot/run_hosting.sh); здесь — только ручной запуск про запас.
 on:
-  schedule:
-    - cron: "*/5 * * * *"
   workflow_dispatch: {}
 
 concurrency:
