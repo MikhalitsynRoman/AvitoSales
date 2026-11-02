@@ -313,11 +313,18 @@ def process_telegram_updates(user_id: int, offset: int, timeout: int) -> int:
     new_offset = offset
     for upd in updates:
         new_offset = max(new_offset, upd["update_id"])
+        # след каждого обработанного обновления — чтобы снаружи было видно, что бот получил и ответил
+        if "callback_query" in upd:
+            what = f"кнопка {upd['callback_query'].get('data', '')}"
+        else:
+            m = upd.get("message") or {}
+            what = f"сообщение из чата {m.get('chat', {}).get('id')}: {(m.get('text') or '')[:40]}"
         try:
             if "callback_query" in upd:
                 handle_callback(user_id, upd["callback_query"])
             elif "message" in upd:
                 handle_message(user_id, upd["message"])
+            sheets.set_state("last_update", f"{_now()} {what} → обработано")
         except Exception as e:
             print("ERROR handling update:", traceback.format_exc())
             # лог на хостинге не виден снаружи — оставляем след в таблице и предупреждаем Романа
