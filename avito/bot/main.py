@@ -273,6 +273,10 @@ def main() -> None:
     sheets.set_state("last_run", datetime.now(MSK).strftime("%d.%m.%Y %H:%M:%S") + f" ({os.uname().nodename if hasattr(os, 'uname') else 'local'})")
     offset = int(sheets.get_state("telegram_last_update_id", "0") or "0")
     deadline = time.time() + RUN_SECONDS
+    until_second = os.getenv("RUN_UNTIL_SECOND")
+    if until_second:
+        now = time.time()
+        deadline = max(now - now % 60 + int(until_second), now + 5)
     last_avito_check = 0.0
 
     while True:

@@ -8,4 +8,4 @@ if [ -f "$LOG" ] && [ "$(stat -c%s "$LOG")" -gt 2000000 ]; then
 fi
 
 cd "$APP" || exit 1
-RUN_SECONDS=40 exec flock -n "$HOME/.avito_bot.lock" "$APP/.venv/bin/python" avito/bot/main.py >> "$LOG" 2>&1
+RUN_SECONDS=40 RUN_UNTIL_SECOND=52 exec flock -n "$HOME/.avito_bot.lock" "$APP/.venv/bin/python" avito/bot/main.py >> "$LOG" 2>&1
