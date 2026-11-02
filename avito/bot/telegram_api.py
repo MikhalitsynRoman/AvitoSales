@@ -2,7 +2,6 @@ import socket
 import time
 
 import requests
-import urllib3.util.connection as urllib3_connection
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
@@ -10,12 +9,24 @@ from config import BOT_TOKEN
 
 API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
-# С хостинга reg.ru соединение с api.telegram.org иногда не устанавливается за 15 с — из-за этого кнопки «висели».
-# 1) только IPv4: попытка через IPv6 на хостинге может съедать весь таймаут;
+# С хостинга reg.ru соединение с api.telegram.org часто не устанавливается — из-за этого кнопки «висели».
+# Замер 03.11 с хостинга: IPv4 149.154.166.110 — 3 из 3 таймаут, IPv6 2001:67c:4e8:f004::9 — 2 из 3 за ~1 с. Поэтому:
+# 1) для Telegram сначала пробуем IPv6, IPv4 — запасной (Avito и Google не трогаем);
 # 2) одно постоянное соединение (keep-alive) вместо нового на каждый запрос;
 # 3) короткий таймаут на установку соединения и несколько повторов. Повторяем только неудачное соединение
 #    (read=0): если запрос уже ушёл в Telegram, повтор мог бы продублировать сообщение.
-urllib3_connection.allowed_gai_family = lambda: socket.AF_INET
+_TG_HOST = "api.telegram.org"
+_orig_getaddrinfo = socket.getaddrinfo
+
+
+def _getaddrinfo_ipv6_first(host, *args, **kwargs):
+    res = _orig_getaddrinfo(host, *args, **kwargs)
+    if host == _TG_HOST:
+        res = sorted(res, key=lambda a: 0 if a[0] == socket.AF_INET6 else 1)
+    return res
+
+
+socket.getaddrinfo = _getaddrinfo_ipv6_first
 
 _session = requests.Session()
 _session.mount("https://", HTTPAdapter(max_retries=Retry(

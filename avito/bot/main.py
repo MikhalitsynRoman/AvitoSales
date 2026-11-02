@@ -442,7 +442,9 @@ def _run_avito_check(user_id: int) -> None:
     _stats["avito_fails"] = 0
     _stats["last_check"] = time.time()
     _stats["check_secs"] = time.time() - t
-    sheets.set_state("last_alive", f"{_now()} ({_stats['host']})")
+    s = tg.stats
+    sheets.set_state("last_alive", f"{_now()} ({_stats['host']}) | Telegram: запросов {s['calls']}, "
+                                   f"не прошло {s['fails']}, медленных {s['slow']}, макс {s['max_secs']:.1f} с")
 
 
 # ---------- главный цикл ----------
