@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import sys
 import time
 import traceback
@@ -23,7 +24,8 @@ HELP_TEXT = (
     "Что я умею:\n"
     "• Присылаю каждое новое сообщение с Avito с кнопками «✅ Отправить» / «❌ Исправить».\n"
     "• Свободное время на сегодня — просто напишите часы: 15:00, 18:30\n"
-    "• Свой ответ клиенту — ответьте (reply) на карточку клиента.\n\n"
+    "• Свой ответ клиенту — ответьте (reply) на карточку клиента или просто напишите текст, "
+    "я спрошу кнопками, кому его отправить.\n\n"
     "Команды:\n"
     "/status — работает ли бот, заявки за сегодня, что отправлено\n"
     "/booked Имя | Телефон | Когда | Класс | chat_id — записать на пробный"
@@ -176,6 +178,18 @@ def handle_callback(user_id: int, cq: dict) -> None:
         return
 
     action, _, rest = data.partition(":")
+
+    if action in ("slots", "tcancel"):  # кнопки вопроса «Кому отправить этот текст?»
+        tg.answer_callback_query(cq["id"])
+        text = sheets.get_state(f"txt_{rest}", "")
+        if action == "slots" and text:
+            tg.edit_message_text(ADMIN_ID, message_id, f"🕐 Сохранил как свободное время: {text}", {"inline_keyboard": []})
+            _save_slots(text)
+        else:
+            tg.edit_message_text(ADMIN_ID, message_id, f"✖️ Никому не отправлял:\n«{text}»", {"inline_keyboard": []})
+        sheets.set_state(f"txt_{rest}", "")
+        return
+
     row_id = rest.split(":")[0]
     contact = sheets.get_contact_by_id(row_id)  # из памяти — мгновенно
     if not contact:
@@ -183,8 +197,23 @@ def handle_callback(user_id: int, cq: dict) -> None:
         return
     v = contact["values"]
 
-    if action in ("send", "sv", "edit") and _is_sent(v):
-        tg.answer_callback_query(cq["id"], "Уже отправлено ✅")
+    if action in ("send", "sv", "edit", "to") and _is_sent(v):
+        tg.answer_callback_query(cq["id"], "Этому клиенту уже отправлено ✅")
+        return
+
+    if action == "to":
+        pid = rest.split(":")[1]
+        text = sheets.get_state(f"txt_{pid}", "")
+        if not text:
+            tg.answer_callback_query(cq["id"], "Этот текст уже обработан")
+            return
+        tg.answer_callback_query(cq["id"], "Отправляю клиенту…")
+        sheets.set_state(f"txt_{pid}", "")  # второй тап по кнопке не отправит текст ещё раз
+        if _send_to_client(user_id, row_id, text, "отправлено (свой текст)"):
+            tg.edit_message_text(ADMIN_ID, message_id, f"✅ Отправлено: {v['Имя']} ({v['Город']})\n\n«{text}»",
+                                 {"inline_keyboard": []})
+        else:
+            sheets.set_state(f"txt_{pid}", text)  # не ушло — кнопки остаются, можно нажать ещё раз
         return
 
     if action == "send":
@@ -312,11 +341,35 @@ def handle_message(user_id: int, msg: dict) -> None:
         _send_to_client(user_id, row_id, text, "отправлено (свой текст)")
         return
 
-    # обычный текст считаем свободным временем, только если в нём есть часы — иначе случайная фраза затрёт слоты
-    if TIME_RE.search(text):
+    # Только часы («15:00, 18:30», «сегодня 13:00 и 15:00») — это свободное время. Любой другой текст скорее всего
+    # ответ клиенту, написанный без reply, — спрашиваем кнопками, кому его отправить.
+    leftover = re.sub(r"[^a-zа-яё]", "", TIME_RE.sub("", text.lower()))
+    if TIME_RE.search(text) and len(leftover) <= 12:
         _save_slots(text)
         return
-    tg.send_message(ADMIN_ID, "Не понял сообщение 🙂\n\n" + HELP_TEXT)
+    _ask_whom(text)
+
+
+def _pending_contacts(limit: int = 4) -> list[dict]:
+    pending = [c for c in sheets.all_contacts()
+               if c["Имя"] != "—" and (c["Статус"] == "ожидает" or c["Статус"].startswith("ошибка"))]
+    return pending[::-1][:limit]
+
+
+def _ask_whom(text: str) -> None:
+    pending = _pending_contacts()
+    has_times = bool(TIME_RE.search(text))
+    if not pending and not has_times:
+        tg.send_message(ADMIN_ID, "Не понял сообщение 🙂 Сейчас нет клиентов, которые ждут ответа.\n\n" + HELP_TEXT)
+        return
+    question = tg.send_message(ADMIN_ID, f"Кому отправить этот текст?\n\n«{text}»")
+    pid = question.get("message_id")
+    sheets.set_state(f"txt_{pid}", text)
+    rows = [[(f"➡️ {c['Имя']} ({c['Город']}, {c['Дата'][:5]} {c['Время']})", f"to:{c['id']}:{pid}")] for c in pending]
+    if has_times:
+        rows.append([("🕐 Это моё свободное время на сегодня", f"slots:{pid}")])
+    rows.append([("✖️ Никому, отмена", f"tcancel:{pid}")])
+    tg.edit_message_reply_markup(ADMIN_ID, pid, tg.keyboard_rows(rows))
 
 
 def process_telegram_updates(user_id: int, offset: int, timeout: int) -> int:
