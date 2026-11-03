@@ -228,12 +228,23 @@ def update_contact_status(row_id: str, status: str, new_draft: str | None = None
         _set_cell(_contacts_sheet(), row, CONTACTS_HEADERS.index("Черновик ответа") + 1, new_draft)
 
 
+_bookings = None  # строки листа «Записаны на пробный» (в памяти, как и остальные листы)
+
+
+def get_bookings() -> list[dict]:
+    global _bookings
+    if _bookings is None:
+        sheet = _get_or_create_sheet(_spreadsheet(), BOOKINGS_SHEET, BOOKINGS_HEADERS)
+        _bookings = [dict(zip(BOOKINGS_HEADERS, r)) for r in sheet.get_all_values()[1:]]
+    return _bookings
+
+
 def log_booking(name: str, phone: str, chat_id: str, when: str, goal: str) -> None:
-    ss = _spreadsheet()
-    sheet = _get_or_create_sheet(ss, BOOKINGS_SHEET, BOOKINGS_HEADERS)
-    sheet.append_row(value_input_option=RAW, values=[
-        datetime.now().strftime("%d.%m.%Y %H:%M"), name or "—", phone or "—", chat_id, when or "—", goal or "—",
-    ])
+    """when — «05.11.2026 16:30»: по нему бот понимает, что это окно занято."""
+    bookings = get_bookings()
+    row = [datetime.now().strftime("%d.%m.%Y %H:%M"), name or "—", phone or "—", chat_id, when or "—", goal or "—"]
+    _get_or_create_sheet(_spreadsheet(), BOOKINGS_SHEET, BOOKINGS_HEADERS).append_row(row, value_input_option=RAW)
+    bookings.append(dict(zip(BOOKINGS_HEADERS, row)))
 
 # ---------- состояние (ключ -> значение) ----------
 

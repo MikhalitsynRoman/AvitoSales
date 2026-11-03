@@ -12,7 +12,8 @@ from config import ADMIN_ID  # noqa: E402  (грузит avito/bot/.env до и�
 import client as avito_client  # noqa: E402
 import sheets  # noqa: E402
 import telegram_api as tg  # noqa: E402
-from script_engine import TIME_RE, analyze_dialog, category_text, generate_variants  # noqa: E402
+from script_engine import (TIME_RE, ZOOM_MARK, analyze_dialog, booking_key, category_text,  # noqa: E402
+                           expand_slots, generate_variants)
 
 MSK = timezone(timedelta(hours=3))
 MAX_CHATS_TO_SCAN = 40
@@ -23,11 +24,16 @@ RUN_SECONDS = int(os.getenv("RUN_SECONDS", "0") or "0")
 HELP_TEXT = (
     "Что я умею:\n"
     "• Присылаю каждое новое сообщение с Avito с кнопками «✅ Отправить» / «❌ Исправить».\n"
-    "• Свободное время на сегодня — просто напишите часы: 15:00, 18:30\n"
+    "• Свободное время на сегодня — напишите часы (15:00, 18:00) или промежуток (15:00-18:00): "
+    "в каждый час записываю до 2 человек по 30 минут.\n"
+    "• Когда клиент выбрал время, черновиком будет ваше сообщение со ссылкой на Zoom; "
+    "после отправки сам внесу его в «Записаны на пробный».\n"
     "• Свой ответ клиенту — ответьте (reply) на карточку клиента или просто напишите текст, "
     "я спрошу кнопками, кому его отправить.\n\n"
     "Команды:\n"
-    "/status — работает ли бот, заявки за сегодня, что отправлено\n"
+    "/status — работает ли бот, заявки и записи за сегодня, свободные окна\n"
+    "/price около 1000 ₽ за час — что отвечать на вопрос о цене (/price без текста — не называть цену)\n"
+    "/zoom https://… — ссылка Zoom для подтверждения записи\n"
     "/booked Имя | Телефон | Когда | Класс | chat_id — записать на пробный"
 )
 
@@ -60,6 +66,39 @@ def today_slots() -> str:
     if not _same_day(sheets.get_state("slots_date", ""), today_str()):
         return ""
     return sheets.get_state("slots_text", "")
+
+
+def booked_set() -> set:
+    """Занятые окна «дд.мм.гггг ЧЧ:ММ» из листа «Записаны на пробный»."""
+    return {b.get("Когда пробный урок", "").strip() for b in sheets.get_bookings()}
+
+
+def free_slots_today() -> list[str]:
+    """Окна по 30 минут из часов, которые Роман дал на сегодня, без занятых и уже прошедших (+15 мин на ответ)."""
+    now = datetime.now(MSK)
+    booked = booked_set()
+    result = []
+    for s in expand_slots(today_slots()):
+        h, m = map(int, s.split(":"))
+        if h * 60 + m < now.hour * 60 + now.minute + 15 or f"{today_str()} {s}" in booked:
+            continue
+        result.append(s)
+    return result
+
+
+def _build_variants(name: str, client_text: str, a: dict) -> list[str]:
+    return generate_variants(name, client_text, ", ".join(free_slots_today()), a, booked_set(),
+                             sheets.get_state("price_hint", ""), sheets.get_state("zoom_link", ""))
+
+
+def _save_meta(row_id: str, a: dict) -> None:
+    """Что пригодится при отправке: о каком времени договорились (для записи на пробный) и телефон."""
+    book = ""
+    if a.get("confirmed"):
+        d, hhmm = a["confirmed"]
+        key = booking_key(d or datetime.now(MSK).date(), hhmm)
+        book = "" if key in booked_set() else key
+    sheets.set_state(f"meta_{row_id}", json.dumps({"book": book, "phone": a.get("phone") or ""}, ensure_ascii=False))
 
 
 def _note_error(where: str, err) -> None:
@@ -182,7 +221,24 @@ def _send_to_client(user_id: int, row_id: str, text: str, status: str) -> bool:
         _show_sent(row_id, v, text)
     finally:
         sheets.update_contact_status(row_id, status, new_draft=text)
+        if ZOOM_MARK in text:
+            _log_trial_booking(row_id, v)
     return True
+
+
+def _log_trial_booking(row_id: str, v: dict) -> None:
+    """Ушла ссылка на Zoom — значит, человек записан: заносим в «Записаны на пробный», окно становится занятым."""
+    try:
+        meta = json.loads(sheets.get_state(f"meta_{row_id}", "") or "{}")
+    except ValueError:
+        meta = {}
+    when = meta.get("book") or "время не определил — уточните в таблице"
+    sheets.log_booking(v["Имя"], meta.get("phone") or "—", v["chat_id"], when, v["Категория"])
+    meta["book"] = ""
+    sheets.set_state(f"meta_{row_id}", json.dumps(meta, ensure_ascii=False))
+    tg.send_message(ADMIN_ID, f"📅 Записал на пробный: {v['Имя']} ({v['Город']}) — {when}"
+                              + (f", тел. {meta['phone']}" if meta.get("phone") else "")
+                              + "\nСтрока добавлена в лист «Записаны на пробный».")
 
 
 def _show_sent(row_id: str, v: dict, text: str) -> None:
@@ -262,8 +318,17 @@ def handle_callback(user_id: int, cq: dict) -> None:
         if row_id in _variant_msgs:
             tg.answer_callback_query(cq["id"], "Варианты уже открыты ниже ⬇️")
             return
-        tg.answer_callback_query(cq["id"])
-        variants = _variants_for(row_id, v)
+        tg.answer_callback_query(cq["id"], "Читаю переписку…")
+        # перечитываем переписку заново: с момента карточки могли написать и клиент, и вы прямо в Avito,
+        # а свободные окна могли заняться
+        dialog = _load_dialog(user_id, v["chat_id"])
+        if dialog:
+            a = analyze_dialog(dialog)
+            variants = _build_variants(v["Имя"], a["batch_text"] or v["Сообщение клиента"], a)
+            sheets.set_state(f"var_{row_id}", json.dumps(variants, ensure_ascii=False))
+            _save_meta(row_id, a)
+        else:
+            variants = _variants_for(row_id, v)
         text, markup = _variant_screen(row_id, v["Имя"], variants, 0)
         sent = tg.send_message(ADMIN_ID, text, reply_markup=markup)
         _variant_msgs[row_id] = sent.get("message_id")
@@ -308,7 +373,14 @@ def status_text() -> str:
     else:
         lines.append(f"Avito проверен {ago} с назад (проверка заняла {_stats['check_secs']:.1f} с)")
     slots = today_slots()
-    lines.append(f"Свободное время сегодня: {slots}" if slots else "Свободное время на сегодня не указано — пришлите часы, например 15:00, 18:30")
+    if slots:
+        free = free_slots_today()
+        lines.append(f"Свободные окна сегодня (по 30 мин): {', '.join(free) if free else 'все заняты или прошли'}")
+    else:
+        lines.append("Свободное время на сегодня не указано — пришлите часы, например 15:00, 18:00 или 15:00-18:00")
+    upcoming = sorted(b for b in booked_set() if b[:10] == today_str() or b[:10] > today_str())
+    if upcoming:
+        lines.append(f"Записаны на пробный: {', '.join(b[:5] + ' ' + b[11:] for b in upcoming[:8])}")
 
     today = today_str()
     todays = [c for c in sheets.all_contacts() if _same_day(c["Дата"], today) and c["Имя"] != "—"]
@@ -338,7 +410,10 @@ def status_text() -> str:
 def _save_slots(text: str) -> None:
     sheets.set_state("slots_text", text)
     sheets.set_state("slots_date", today_str())
-    tg.send_message(ADMIN_ID, f"Принял свободное время на сегодня: {text}\nБуду предлагать клиентам эти часы.")
+    free = free_slots_today()
+    tg.send_message(ADMIN_ID, f"Принял свободное время на сегодня: {text}\n"
+                              f"Окна по 30 минут (по 2 человека в час): {', '.join(free) if free else 'все уже прошли'}\n"
+                              "Буду предлагать клиентам ближайшие свободные.")
 
 
 def handle_message(user_id: int, msg: dict) -> None:
@@ -354,6 +429,23 @@ def handle_message(user_id: int, msg: dict) -> None:
 
     if text.startswith("/status"):
         tg.send_message(ADMIN_ID, status_text())
+        return
+
+    if text.startswith("/zoom"):
+        link = text[len("/zoom"):].strip()
+        if ZOOM_MARK not in link:
+            tg.send_message(ADMIN_ID, "Пришлите так: /zoom https://us06web.zoom.us/j/…")
+            return
+        sheets.set_state("zoom_link", link)
+        tg.send_message(ADMIN_ID, "Сохранил ссылку Zoom — буду отправлять её, когда клиент выберет время.")
+        return
+
+    if text.startswith("/price"):
+        hint = text[len("/price"):].strip()
+        sheets.set_state("price_hint", hint)
+        tg.send_message(ADMIN_ID, f"На вопрос о цене буду отвечать: «По стоимости — {hint}: точнее сориентирую на "
+                                  "пробном уроке…»" if hint else
+                        "Цену больше не называю: отвечаю, что стоимость зависит от частоты и целей.")
         return
 
     if text.startswith("/booked"):
@@ -462,7 +554,8 @@ def maybe_ask_daily_slots() -> None:
     prompt = tg.send_message(
         ADMIN_ID,
         "Доброе утро! Какое время сегодня свободно для пробных уроков?\n"
-        "Напишите через запятую, например: 15:00, 18:30",
+        "Напишите свободные часы (15:00, 18:00) или промежуток (15:00-18:00) — "
+        "в каждый час запишу до 2 человек по 30 минут.",
     )
     sheets.set_state("slots_prompt_date", today)
     sheets.set_state("slots_prompt_msg_id", str(prompt.get("message_id", "")))
@@ -508,7 +601,7 @@ def _notify_client(user_id: int, chat_id: str, name: str, city: str, avito_msg_i
     a = analyze_dialog(dialog)
     client_text = a["batch_text"] or last_text
     category = category_text(a)
-    variants = generate_variants(name, client_text, slots_text, a)
+    variants = _build_variants(name, client_text, a)
     draft = variants[0]
 
     # один клиент — одна строка: если он уже писал, обновляем его строку, а старую карточку гасим
@@ -531,6 +624,7 @@ def _notify_client(user_id: int, chat_id: str, name: str, city: str, avito_msg_i
                            sent.get("message_id"), row_id=row_id)
     sheets.set_state(f"var_{row_id}", json.dumps(variants, ensure_ascii=False))
     sheets.set_state(f"card_{sent.get('message_id')}", row_id)
+    _save_meta(row_id, a)
 
 
 REFRESH_VERSION = "dialog-v1"
