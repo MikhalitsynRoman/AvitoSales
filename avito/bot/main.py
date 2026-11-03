@@ -12,7 +12,7 @@ from config import ADMIN_ID  # noqa: E402  (грузит avito/bot/.env до и�
 import client as avito_client  # noqa: E402
 import sheets  # noqa: E402
 import telegram_api as tg  # noqa: E402
-from script_engine import TIME_RE, classify_request, generate_variants  # noqa: E402
+from script_engine import TIME_RE, analyze_dialog, category_text, generate_variants  # noqa: E402
 
 MSK = timezone(timedelta(hours=3))
 MAX_CHATS_TO_SCAN = 40
@@ -68,14 +68,50 @@ def _note_error(where: str, err) -> None:
 
 # ---------- карточки ----------
 
-def _card_text(v: dict) -> str:
+HISTORY_ON_CARD = 8
+
+
+def _load_dialog(user_id: int, chat_id: str) -> list[dict]:
+    """Переписка с клиентом из Avito, от старых сообщений к новым (системные помечены)."""
+    try:
+        raw = avito_client.get_messages(user_id, chat_id, limit=40).get("messages", [])
+    except Exception as e:
+        _note_error("переписка Avito", e)
+        return []
+    return [{"direction": m.get("direction"), "text": (m.get("content") or {}).get("text") or "",
+             "created": m.get("created", 0), "system": m.get("type") == "system"} for m in reversed(raw)]
+
+
+def _history_lines(dialog: list[dict], name: str) -> str:
+    msgs = [m for m in dialog if m["text"].strip() and not m.get("system")][-HISTORY_ON_CARD:]
+    lines = []
+    for m in msgs:
+        when = datetime.fromtimestamp(m["created"], MSK).strftime("%d.%m %H:%M")
+        who = f"👤 {name}" if m["direction"] == "in" else "🧑‍🏫 Вы"
+        text = m["text"].strip().replace("\n", " ")
+        lines.append(f"{when} {who}: {text[:180] + '…' if len(text) > 180 else text}")
+    return "\n".join(lines)
+
+
+def _card_text(v: dict, dialog: list[dict] | None = None, phone: str | None = None) -> str:
+    history = _history_lines(dialog or [], v["Имя"])
     return (
         f"Новое сообщение на Avito\n"
         f"От: {v['Имя']} ({v['Город']})\n"
         f"Категория: {v['Категория']}\n"
-        f"Текст: {v['Сообщение клиента']}\n\n"
-        f"Черновик ответа:\n{v['Черновик ответа']}"
+        + (f"📞 Телефон из переписки: {phone}\n" if phone else "")
+        + f"Пишет сейчас: {v['Сообщение клиента']}\n\n"
+        + (f"Переписка (последние сообщения):\n{history}\n\n" if history else "")
+        + f"Черновик ответа:\n{v['Черновик ответа']}"
     )
+
+
+def _retire_old_cards(row_id: str, old_card_id: str | None) -> None:
+    """Клиент написал ещё раз: кнопки старой карточки и экрана вариантов больше не нужны."""
+    note = tg.inline_keyboard([("↪️ Клиент написал ещё — новая карточка ниже", "noop")])
+    for msg_id in {old_card_id, _variant_msgs.pop(row_id, None)}:
+        if msg_id:
+            tg.edit_message_reply_markup(ADMIN_ID, int(msg_id), note)
 
 
 def _sent_card_text(v: dict, sent_text: str) -> str:
@@ -333,7 +369,8 @@ def handle_message(user_id: int, msg: dict) -> None:
         if str(replied_id) == sheets.get_state("slots_prompt_msg_id", ""):
             _save_slots(text)
             return
-        row_id = sheets.find_row_id_by_telegram_msg_id(replied_id) or sheets.get_state(f"reply_{replied_id}", "")
+        row_id = (sheets.find_row_id_by_telegram_msg_id(replied_id) or sheets.get_state(f"card_{replied_id}", "")
+                  or sheets.get_state(f"reply_{replied_id}", ""))
         if not row_id:
             tg.send_message(ADMIN_ID, "Не понял, к какой заявке это ответ. Ответьте (reply) на карточку клиента.")
             return
@@ -455,20 +492,35 @@ def check_new_avito_messages(user_id: int) -> None:
         name = client_user["name"] if client_user else "—"
         item = chat.get("context", {}).get("value", {})
         city = (item.get("location") or {}).get("title", "—")
-        client_text = (last.get("content") or {}).get("text", "")
-        category = classify_request(client_text)
-        variants = generate_variants(name, client_text, slots_text)
+        last_text = (last.get("content") or {}).get("text", "")
+
+        # смотрим всю переписку, а не одно последнее сообщение: класс, цель, о чём уже договорились
+        dialog = _load_dialog(user_id, chat["id"]) or [{"direction": "in", "text": last_text, "created": time.time()}]
+        a = analyze_dialog(dialog)
+        client_text = a["batch_text"] or last_text
+        category = category_text(a)
+        variants = generate_variants(name, client_text, slots_text, a)
         draft = variants[0]
 
-        # карточка уходит с кнопками сразу, а запись в таблицу — после
-        row_id = sheets.new_row_id()
+        # один клиент — одна строка: если он уже писал, обновляем его строку, а старую карточку гасим
+        existing = sheets.find_contact_by_chat(chat["id"])
+        row_id = existing["values"]["id"] if existing and existing["values"]["id"] else sheets.new_row_id()
         card = {"Имя": name, "Город": city, "Категория": category, "Сообщение клиента": client_text,
                 "Черновик ответа": draft}
-        sent = tg.send_message(ADMIN_ID, _card_text(card), reply_markup=_card_buttons(row_id))
+        sent = tg.send_message(ADMIN_ID, _card_text(card, dialog, a.get("phone")), reply_markup=_card_buttons(row_id))
         print(f"NEW_MESSAGE: {name} ({city}) -> notified")
-        sheets.log_contact(chat["id"], avito_msg_id, name, city, category, client_text, draft,
-                           sent.get("message_id"), row_id=row_id)
+        if existing and existing["values"]["id"]:
+            _retire_old_cards(row_id, existing["values"].get("telegram_msg_id"))
+            sheets.update_contact(row_id, {
+                "Дата": today_str(), "Время": _hhmm(), "Имя": name, "Город": city, "Категория": category,
+                "Сообщение клиента": client_text, "Черновик ответа": draft, "Статус": "ожидает",
+                "avito_msg_id": avito_msg_id, "telegram_msg_id": sent.get("message_id"),
+            })
+        else:
+            sheets.log_contact(chat["id"], avito_msg_id, name, city, category, client_text, draft,
+                               sent.get("message_id"), row_id=row_id)
         sheets.set_state(f"var_{row_id}", json.dumps(variants, ensure_ascii=False))
+        sheets.set_state(f"card_{sent.get('message_id')}", row_id)
         seen_ids.add(avito_msg_id)
 
     if not bootstrapped:
@@ -537,6 +589,10 @@ def main() -> None:
     _stats["started"] = _now()
     sheets.set_state("last_start", f"{_now()} ({host})")
     user_id = avito_client.get_self_account()["id"]
+    if RUN_SECONDS:  # только на хостинге: склейка удаляет строки, второй процесс сбил бы номера строк
+        removed = sheets.dedupe_contacts()
+        if removed:
+            sheets.set_state("last_dedupe", f"{_now()}: склеил повторы клиентов, убрал строк: {removed}")
     sheets.get_logged_msg_ids()  # прогреваем кэш таблицы до первых нажатий
     sheets.set_state("last_run", f"{_now()} ({host})")
     offset = int(sheets.get_state("telegram_last_update_id", "0") or "0")

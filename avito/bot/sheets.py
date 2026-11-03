@@ -147,6 +147,56 @@ def get_contact_by_id(row_id: str) -> dict | None:
     return None
 
 
+def find_contact_by_chat(chat_id: str) -> dict | None:
+    idx = _IDX["chat_id"]
+    for i, r in sorted(_load_contacts().items(), reverse=True):
+        if r[idx] == chat_id:
+            return {"row": i, "values": dict(zip(CONTACTS_HEADERS, r))}
+    return None
+
+
+def update_contact(row_id: str, fields: dict) -> None:
+    """Переписывает строку клиента одним запросом (новое сообщение того же клиента — та же строка)."""
+    found = get_contact_by_id(row_id)
+    if not found:
+        return
+    row = _load_contacts()[found["row"]]
+    for k, v in fields.items():
+        row[_IDX[k]] = "" if v is None else str(v)
+    end_col = gspread.utils.rowcol_to_a1(found["row"], len(CONTACTS_HEADERS))
+    _contacts_sheet().update(values=[row], range_name=f"A{found['row']}:{end_col}", value_input_option=RAW)
+
+
+def dedupe_contacts() -> int:
+    """Один клиент — одна строка. Склеивает строки с одинаковым chat_id: остаётся первая по месту,
+    в ней — данные самой свежей (имя и город берутся из любой, где они есть). Возвращает, сколько строк удалено.
+    Вызывать только при старте бота: номера строк в памяти после удаления пересчитываются."""
+    global _contacts
+    sheet = _contacts_sheet()
+    rows = sheet.get_all_values()[1:]
+    groups = {}
+    for i, r in enumerate(rows, start=2):
+        r = (r + [""] * len(CONTACTS_HEADERS))[:len(CONTACTS_HEADERS)]
+        if r[_IDX["chat_id"]]:
+            groups.setdefault(r[_IDX["chat_id"]], []).append((i, r))
+    to_delete = []
+    for items in groups.values():
+        if len(items) < 2:
+            continue
+        keep_row = items[0][0]
+        merged = list(items[-1][1])
+        for col in ("Имя", "Город"):
+            if merged[_IDX[col]] in ("", "—"):
+                merged[_IDX[col]] = next((r[_IDX[col]] for _, r in reversed(items) if r[_IDX[col]] not in ("", "—")), "—")
+        end_col = gspread.utils.rowcol_to_a1(keep_row, len(CONTACTS_HEADERS))
+        sheet.update(values=[merged], range_name=f"A{keep_row}:{end_col}", value_input_option=RAW)
+        to_delete += [i for i, _ in items[1:]]
+    for i in sorted(to_delete, reverse=True):
+        sheet.delete_rows(i)
+    _contacts = None  # перечитать с новыми номерами строк
+    return len(to_delete)
+
+
 def find_row_id_by_telegram_msg_id(telegram_msg_id: int) -> str | None:
     idx = _IDX["telegram_msg_id"]
     for r in _load_contacts().values():
