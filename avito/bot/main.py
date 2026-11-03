@@ -12,7 +12,7 @@ from config import ADMIN_ID  # noqa: E402  (грузит avito/bot/.env до и�
 import client as avito_client  # noqa: E402
 import sheets  # noqa: E402
 import telegram_api as tg  # noqa: E402
-from script_engine import (TIME_RE, ZOOM_MARK, analyze_dialog, booking_key, category_text,  # noqa: E402
+from script_engine import (TIME_RE, ZOOM_MARK, analyze_dialog, booking_key, category_text, is_past,  # noqa: E402
                            expand_slots, generate_variants)
 
 MSK = timezone(timedelta(hours=3))
@@ -188,6 +188,39 @@ def _variant_screen(row_id: str, name: str, variants: list[str], idx: int) -> tu
     return text, markup
 
 
+def _stale_reason(text: str, v: dict, row_id: str) -> str:
+    """Почему черновик нельзя отправлять как есть: время в нём уже прошло. Пустая строка — можно.
+    Черновик готовится в момент прихода сообщения, а нажать «Отправить» могут через несколько часов."""
+    now = datetime.now(MSK)
+    try:
+        meta = json.loads(sheets.get_state(f"meta_{row_id}", "") or "{}")
+    except ValueError:
+        meta = {}
+    if ZOOM_MARK in text and meta.get("book"):
+        when = datetime.strptime(meta["book"], "%d.%m.%Y %H:%M").replace(tzinfo=MSK)
+        if when < now:
+            return f"это запись на {meta['book']}, а это время уже прошло"
+    if "сегодня" in text.lower():
+        times = [t.replace(".", ":") for t in TIME_RE.findall(text)]
+        drafted_today = _same_day(v.get("Дата", ""), today_str())
+        if times and not drafted_today:
+            return f"черновик писался {v.get('Дата')}, и «сегодня в {times[0]}» уже не про сегодня"
+        past = [t for t in times if is_past(now.date(), t.zfill(5), now, margin_min=0)]
+        if past:
+            return f"время {', '.join(past)} сегодня уже прошло"
+    return ""
+
+
+def _refuse_if_stale(cq_id: str, text: str, v: dict, row_id: str) -> bool:
+    reason = _stale_reason(text, v, row_id)
+    if not reason:
+        return False
+    tg.answer_callback_query(cq_id, "Не отправил — время в черновике устарело")
+    tg.send_message(ADMIN_ID, f"⚠️ Не отправил {v['Имя']}: {reason}.\n"
+                              "Нажмите «❌ Исправить» — перечитаю переписку и предложу актуальное время.")
+    return True
+
+
 def _is_sent(v: dict) -> bool:
     return v["Статус"].startswith("отправлено")
 
@@ -310,6 +343,8 @@ def handle_callback(user_id: int, cq: dict) -> None:
         return
 
     if action == "send":
+        if _refuse_if_stale(cq["id"], v["Черновик ответа"], v, row_id):
+            return
         tg.answer_callback_query(cq["id"], "Отправляю клиенту…")
         _send_to_client(user_id, row_id, v["Черновик ответа"], "отправлено")
         return
@@ -326,6 +361,7 @@ def handle_callback(user_id: int, cq: dict) -> None:
             a = analyze_dialog(dialog)
             variants = _build_variants(v["Имя"], a["batch_text"] or v["Сообщение клиента"], a)
             sheets.set_state(f"var_{row_id}", json.dumps(variants, ensure_ascii=False))
+            sheets.set_state(f"vardate_{row_id}", today_str())
             _save_meta(row_id, a)
         else:
             variants = _variants_for(row_id, v)
@@ -344,9 +380,12 @@ def handle_callback(user_id: int, cq: dict) -> None:
         return
 
     if action == "sv":
-        tg.answer_callback_query(cq["id"], "Отправляю клиенту…")
         idx = int(rest.split(":")[1])
         chosen = _variants_for(row_id, v)[idx]
+        # экран вариантов мог пролежать долго; «сегодня» в нём — про день, когда его открыли
+        if _refuse_if_stale(cq["id"], chosen, {**v, "Дата": sheets.get_state(f"vardate_{row_id}", v["Дата"])}, row_id):
+            return
+        tg.answer_callback_query(cq["id"], "Отправляю клиенту…")
         _variant_msgs[row_id] = message_id
         _send_to_client(user_id, row_id, chosen, f"отправлено (вариант {idx + 1})")
         return
@@ -582,6 +621,19 @@ def check_new_avito_messages(user_id: int) -> None:
             )
             continue
 
+        # Старое сообщение — не новая заявка: чат просто поднялся в списке Avito (03.11 так «пришли» 11 переписок
+        # 21–27 октября, где давно всё решилось). Запоминаем, что видели, и молчим.
+        created = last.get("created") or 0
+        if created and time.time() - created > OLD_MESSAGE_SECONDS:
+            existing = sheets.find_contact_by_chat(chat["id"])
+            if existing and existing["values"]["id"]:
+                sheets.update_contact(existing["values"]["id"], {"avito_msg_id": avito_msg_id})
+            else:
+                sheets.log_contact(chat["id"], avito_msg_id, "", "", "", "", "", None,
+                                   status="пропущено (старое сообщение)")
+            seen_ids.add(avito_msg_id)
+            continue
+
         client_user = next((u for u in chat.get("users", []) if u["id"] != user_id), None)
         name = client_user["name"] if client_user else "—"
         item = chat.get("context", {}).get("value", {})
@@ -624,7 +676,39 @@ def _notify_client(user_id: int, chat_id: str, name: str, city: str, avito_msg_i
                            sent.get("message_id"), row_id=row_id)
     sheets.set_state(f"var_{row_id}", json.dumps(variants, ensure_ascii=False))
     sheets.set_state(f"card_{sent.get('message_id')}", row_id)
+    sheets.set_state(f"vardate_{row_id}", today_str())
     _save_meta(row_id, a)
+
+
+OLD_MESSAGE_SECONDS = 48 * 3600
+
+
+def skip_old_pending_once(user_id: int) -> None:
+    """Один раз: заявки «ожидает», где последнее сообщение клиента старше двух суток, — это не новые обращения.
+    Помечаем «пропущено», гасим кнопки (чтобы не отправить им черновик с прошедшим временем), Роману — список."""
+    if sheets.get_state("cleanup_old", "") == "v1":
+        return
+    sheets.set_state("cleanup_old", "v1")
+    skipped = []
+    for c in sheets.all_contacts():
+        if c["Статус"] != "ожидает" or c["Имя"] == "—":
+            continue
+        last_in = [m for m in _load_dialog(user_id, c["chat_id"]) if m["direction"] == "in" and m["text"].strip()]
+        if not last_in or time.time() - last_in[-1]["created"] <= OLD_MESSAGE_SECONDS:
+            continue
+        when = datetime.fromtimestamp(last_in[-1]["created"], MSK)
+        sheets.update_contact(c["id"], {"Статус": f"пропущено (старое сообщение от {when:%d.%m})",
+                                        "Дата": when.strftime("%d.%m.%Y"), "Время": when.strftime("%H:%M")})
+        if c.get("telegram_msg_id"):
+            tg.edit_message_reply_markup(ADMIN_ID, int(c["telegram_msg_id"]), tg.inline_keyboard(
+                [(f"🕓 Старое сообщение от {when:%d.%m} — пропущено", "noop")]))
+        _variant_msgs.pop(c["id"], None)
+        skipped.append(f"• {c['Имя']} — последнее сообщение {when:%d.%m}")
+    if skipped:
+        tg.send_message(ADMIN_ID, "Разобрался с карточками, пришедшими в 18:27: это не новые заявки, а старые переписки "
+                                  "(клиенты писали больше двух суток назад). Пометил их «пропущено» и отключил кнопки, "
+                                  "чтобы случайно не отправить черновик с прошедшим временем:\n" + "\n".join(skipped)
+                                  + "\n\nЕсли кому-то хотите написать — ответьте (reply) на его карточку.")
 
 
 REFRESH_VERSION = "dialog-v1"
@@ -717,6 +801,7 @@ def main() -> None:
     if RUN_SECONDS:
         try:
             refresh_pending_once(user_id)
+            skip_old_pending_once(user_id)
         except Exception as e:
             _note_error("пересчёт заявок", e)
     sheets.set_state("last_run", f"{_now()} ({host})")

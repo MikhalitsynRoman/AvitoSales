@@ -19,6 +19,14 @@ RECORD_RE = re.compile(r"как.*запис|набира(ете|ют)|свобо
 AGREE_RE = re.compile(r"^\s*(да|давайте|давай|хорошо|ок|окей|можно|согласн|подходит|отлично|конечно|го|супер)\b"
                       r"|давайте|согласн|подходит|удобно|есть возможность|можно\s+(завтра|сегодня|послезавтра)", re.I)
 DECLINE_TIME_RE = re.compile(r"не\s+удобно|неудобно|не\s+подходит|не\s+сможем|не\s+можем", re.I)
+# Клиент отказался — не уговариваем и не зовём на пробный, вежливо прощаемся и оставляем дверь открытой
+REFUSE_RE = re.compile(r"уже\s+(нашл|наш[её]л|записал|занима|есть\s+репет)|нашли\s+друг|к\s+другому|другого\s+репет"
+                       r"|нашли\s+репет|не\s+нужн|уже\s+не\s+над|не\s+актуальн|неактуальн|передумал|не\s+интерес"
+                       r"|откаж|^\s*(нет,?\s+спасибо|не надо)\s*[.!]*\s*$", re.I)
+# Голое «нет» — отказ, только если мы не спрашивали про время; на «будет удобно завтра в 12:00?» это «время не подходит»
+BARE_NO_RE = re.compile(r"^\s*(нет|неь|не|нит|неа)\s*[.!]*\s*$", re.I)
+# Реклама/спам от сервисов (ссылки, «попробуйте наш…») — отвечать не нужно
+SPAM_RE = re.compile(r"https?://|www\.|попробуйте\s+(провести|наш|сервис)|наш[аи]?\s+(платформ|сервис)", re.I)
 POSTPONE_RE = re.compile(r"боле(е|ет|ю|ла|л)|заболе|температур|перенес|не смож|не получ|позже|потом напиш|подума", re.I)
 # «в 17», «в 17:30», «к 5 вечера» — время, которое назвал клиент (не «в 11 классе», не «на 70 баллов»)
 CLIENT_HOUR_RE = re.compile(r"\b(?:в|к|на)\s*(\d{1,2})(?:[:.](\d{2}))?\b(?!\s*(?:кл|бал|раз|%|\+))", re.I)
@@ -135,6 +143,20 @@ def analyze_dialog(messages: list[dict], now: datetime | None = None) -> dict:
     elif agrees and len(our_times) >= 2:
         choose_between = our_times[:2]
 
+    bare_no = bool(BARE_NO_RE.match(batch_text))
+    asked_time = bool(our_last and (our_times or re.search(r"удобно|подключит|сможете", our_last["text"], re.I)))
+
+    # прошедшее время никогда не подтверждаем и не предлагаем: «да» на наше вчерашнее «сегодня в 16:30»
+    # или «давайте в 13:00», когда уже вечер, — это не запись, а повод предложить новое время
+    time_passed = False
+    if confirmed and is_past(confirmed[0] or now.date(), confirmed[1], now):
+        confirmed, time_passed = None, True
+    if choose_between:
+        choose_between = [t for t in choose_between if not is_past(our_day or now.date(), t, now)]
+        if len(choose_between) < 2:
+            time_passed = time_passed or not choose_between
+            choose_between = []
+
     return {
         "grade": grade,
         "exam": exam,
@@ -144,14 +166,15 @@ def analyze_dialog(messages: list[dict], now: datetime | None = None) -> dict:
         "category": category,
         "batch_text": batch_text,
         "invited": any("пробн" in m["text"].lower() for m in our_msgs),
-        "link_sent": any(ZOOM_MARK in m["text"] for m in our_msgs),
+        # ссылку отправляли недавно — значит, человек записан на ближайшие дни; старая ссылка (пробный уже прошёл) не в счёт
+        "link_sent": any(ZOOM_MARK in m["text"] and now - _dt(m["created"]) < timedelta(days=3) for m in our_msgs),
         "price_told": our_price,
         "asked_grade": any("класс" in m["text"].lower() and "?" in m["text"] for m in our_msgs),
         "has_our_msgs": bool(our_msgs),
         # здороваемся, только если с нашего последнего сообщения прошло больше 12 часов
         "need_greeting": not our_last or (now - _dt(our_last["created"])) > timedelta(hours=12),
         "agrees": agrees,
-        "declines_time": bool(DECLINE_TIME_RE.search(batch_text)),
+        "declines_time": bool(DECLINE_TIME_RE.search(batch_text)) or (bare_no and asked_time),
         "postpones": bool(POSTPONE_RE.search(batch_text)),
         "asks_price": bool(PRICE_RE.search(batch_text)),
         "asks_format": bool(FORMAT_RE.search(batch_text)),
@@ -159,8 +182,17 @@ def analyze_dialog(messages: list[dict], now: datetime | None = None) -> dict:
         "day": day,
         "confirmed": confirmed,
         "choose_between": choose_between,
+        "time_passed": time_passed,
+        "declined": bool(REFUSE_RE.search(batch_text)) or (bare_no and not asked_time),
+        "spam": bool(SPAM_RE.search(batch_text)),
         "now": now,
     }
+
+
+def is_past(d: date, hhmm: str, now: datetime, margin_min: int = 15) -> bool:
+    """Время уже прошло (или до него меньше 15 минут — клиент не успеет подключиться)."""
+    h, m = map(int, hhmm.split(":"))
+    return datetime(d.year, d.month, d.day, h, m, tzinfo=MSK) < now + timedelta(minutes=margin_min)
 
 
 def _client_time(text: str) -> str | None:
@@ -220,6 +252,14 @@ def profile_text(a: dict) -> str:
 
 def _request_summary(a: dict) -> str:
     today = a["now"].date()
+    if a["spam"]:
+        return "реклама/спам — отвечать не нужно"
+    if a["declined"]:
+        return "отказ — уже не нужно"
+    if a["time_passed"]:
+        return "согласен(на), но предложенное время уже прошло"
+    if a["declines_time"]:
+        return "предложенное время не подошло"
     if a["confirmed"]:
         d, hhmm = a["confirmed"]
         return f"выбрал(а) время: {day_label(d or today, today)} в {hhmm}"
@@ -307,6 +347,8 @@ def _time_question(slots: list[str], a: dict, polite: bool = True) -> str:
         return f"{lead} сегодня в {slots[0]} или в {slots[1]} мск?"
     if len(slots) == 1:
         return f"{lead} сегодня в {slots[0]} мск?"
+    if a["now"].hour >= 19:  # вечером «сегодня» уже не предлагаем
+        return "Скажите, пожалуйста, во сколько вам будет удобно подключиться завтра? Подберу время."
     return "Скажите, пожалуйста, когда вам будет удобно подключиться — сегодня или завтра? Подберу время."
 
 
@@ -321,10 +363,23 @@ def generate_variants(client_name: str, client_text: str, slots_text: str = "", 
     """slots_text — свободные окна на сегодня (уже без занятых и прошедших), booked — занятые «дд.мм.гггг ЧЧ:ММ»."""
     a = dialog or analyze_dialog([{"direction": "in", "text": client_text or "", "created": 0}])
     booked = booked or set()
-    slots = [x.replace(".", ":").zfill(5) for x in TIME_RE.findall(slots_text or "")]
     today = a["now"].date()
+    # окна «сегодня» — только будущие, даже если кто-то передал список с прошедшими
+    slots = [s for s in (x.replace(".", ":").zfill(5) for x in TIME_RE.findall(slots_text or ""))
+             if not is_past(today, s, a["now"])]
     o = _greeting(client_name, a)
     answers = _answers(a, price_hint)
+
+    # 0. Реклама или отказ — не продаём: на рекламу коротко, отказавшимся — вежливо, без приглашения
+    if a["spam"]:
+        return ["Спасибо, не интересует.", "Спасибо, но не актуально.", "Спасибо, нам не подходит."]
+    if a["declined"]:
+        return [
+            _say(o, "Понял вас, спасибо, что ответили! Если понадобится помощь с математикой — пишите, буду рад "
+                    "помочь. Удачи на экзамене!"),
+            _say(o, "Спасибо, что предупредили! Желаю успехов в подготовке. Если что-то не сложится — пишите, помогу."),
+            _say(o, "Хорошо, понял. Если появятся вопросы по математике — пишите в любое время. Успехов!"),
+        ]
 
     # 1. Уже записан (ссылку отправляли) — подтверждаем, при просьбе — переносим
     if a["link_sent"] and not a["confirmed"]:
@@ -390,7 +445,16 @@ def generate_variants(client_name: str, client_text: str, slots_text: str = "", 
 
     # 5. Уже приглашали, клиент согласен / назвал день — сразу предлагаем конкретное время
     if a["invited"] and (a["agrees"] or a["day"] or a["declines_time"]):
-        lead = "Хорошо, подберём другое время." if a["declines_time"] else "Отлично!"
+        lead = "Отлично! Предложенное время, к сожалению, уже прошло — давайте подберём новое." if a["time_passed"] \
+            else "Хорошо, подберём другое время." if a["declines_time"] else "Отлично!"
+        if a["declines_time"] and not slots and not a["day"]:
+            # предложенное время не подошло, других окон на сегодня нет — спрашиваем, когда удобно клиенту
+            return [
+                _say(o, *answers, "Хорошо, подберём другое время. Подскажите, в какой день и во сколько вам будет удобно? "
+                                  "Пробный идёт 30 минут."),
+                _say(o, *answers, "Без проблем! Когда вам удобнее — в будни или в выходные, днём или вечером? Подстроюсь."),
+                _say(o, *answers, "Понял. Напишите удобные день и время — я подберу окно для бесплатного пробного урока."),
+            ]
         return [
             _say(o, *answers, lead, _time_question(slots, a)),
             _say(o, *answers, "Да, конечно!" if not a["declines_time"] else lead, _time_question(slots, a, polite=False)),
