@@ -13,28 +13,30 @@ BASE_URL = "https://api.avito.ru"
 # Токен живёт ~24 ч; храним его между запусками, Avito не даёт выпускать новый каждую минуту.
 TOKEN_FILE = os.getenv("AVITO_TOKEN_FILE") or os.path.join(os.path.expanduser("~"), ".avito_token.json")
 
-_token_cache = {"access_token": None}
+# Срок храним и в памяти: бот на хостинге работает часами, и токен, взятый при запуске, истекает посреди работы
+# (03.11 в 18:20 так и случилось — Avito начал отвечать 403 каждую минуту).
+_token_cache = {"access_token": None, "expires_at": 0.0}
 
 
-def _load_token_file() -> str | None:
+def _load_token_file() -> tuple[str, float] | None:
     try:
         with open(TOKEN_FILE, encoding="utf-8") as f:
             data = json.load(f)
         if data.get("expires_at", 0) - 300 > time.time():
-            return data["access_token"]
+            return data["access_token"], float(data["expires_at"])
     except (OSError, ValueError, KeyError):
         pass
     return None
 
 
 def get_token(force_new: bool = False) -> str:
-    if _token_cache["access_token"] and not force_new:
+    if _token_cache["access_token"] and not force_new and _token_cache["expires_at"] - 300 > time.time():
         return _token_cache["access_token"]
     if not force_new:
         cached = _load_token_file()
         if cached:
-            _token_cache["access_token"] = cached
-            return cached
+            _token_cache["access_token"], _token_cache["expires_at"] = cached
+            return cached[0]
     resp = requests.post(
         f"{BASE_URL}/token",
         data={
@@ -48,47 +50,41 @@ def get_token(force_new: bool = False) -> str:
     data = resp.json()
     if "access_token" not in data:
         raise RuntimeError(f"Avito не выдал токен: {str(data)[:200]}")
-    _token_cache["access_token"] = data["access_token"]
+    expires_at = time.time() + int(data.get("expires_in", 3600))
+    _token_cache["access_token"], _token_cache["expires_at"] = data["access_token"], expires_at
     try:
         with open(TOKEN_FILE, "w", encoding="utf-8") as f:
-            json.dump({"access_token": data["access_token"],
-                       "expires_at": time.time() + int(data.get("expires_in", 3600))}, f)
+            json.dump({"access_token": data["access_token"], "expires_at": expires_at}, f)
         os.chmod(TOKEN_FILE, 0o600)
     except OSError:
         pass
     return data["access_token"]
 
 
-def _headers() -> dict:
-    return {"Authorization": f"Bearer {get_token()}"}
+def _request(method: str, path: str, **kwargs) -> dict:
+    """Запрос к Avito. На 401/403 (токен истёк или отозван) один раз берём новый токен и повторяем —
+    Avito такой запрос не выполнил, так что повтор безопасен и для отправки сообщения."""
+    for attempt in (1, 2):
+        resp = requests.request(method, f"{BASE_URL}{path}", headers={"Authorization": f"Bearer {get_token(force_new=attempt == 2)}"},
+                                timeout=20, **kwargs)
+        if resp.status_code in (401, 403) and attempt == 1:
+            continue
+        if not resp.ok:
+            raise RuntimeError(f"Avito {resp.status_code} на {path.split('?')[0]}: {resp.text[:200]}")
+        return resp.json()
 
 
 def get_self_account() -> dict:
-    resp = requests.get(f"{BASE_URL}/core/v1/accounts/self", headers=_headers(), timeout=20)
-    resp.raise_for_status()
-    return resp.json()
+    return _request("GET", "/core/v1/accounts/self")
 
 
 def get_chats(user_id: int, limit: int = 100, offset: int = 0) -> dict:
-    resp = requests.get(
-        f"{BASE_URL}/messenger/v2/accounts/{user_id}/chats",
-        headers=_headers(),
-        params={"limit": limit, "offset": offset},
-        timeout=20,
-    )
-    resp.raise_for_status()
-    return resp.json()
+    return _request("GET", f"/messenger/v2/accounts/{user_id}/chats", params={"limit": limit, "offset": offset})
 
 
 def get_messages(user_id: int, chat_id: str, limit: int = 100, offset: int = 0) -> dict:
-    resp = requests.get(
-        f"{BASE_URL}/messenger/v3/accounts/{user_id}/chats/{chat_id}/messages",
-        headers=_headers(),
-        params={"limit": limit, "offset": offset},
-        timeout=20,
-    )
-    resp.raise_for_status()
-    return resp.json()
+    return _request("GET", f"/messenger/v3/accounts/{user_id}/chats/{chat_id}/messages",
+                    params={"limit": limit, "offset": offset})
 
 
 def get_all_chats(user_id: int, max_chats: int = None) -> list:
@@ -108,14 +104,8 @@ def get_all_chats(user_id: int, max_chats: int = None) -> list:
 
 
 def send_message(user_id: int, chat_id: str, text: str) -> dict:
-    resp = requests.post(
-        f"{BASE_URL}/messenger/v1/accounts/{user_id}/chats/{chat_id}/messages",
-        headers=_headers(),
-        json={"message": {"text": text}, "type": "text"},
-        timeout=20,
-    )
-    resp.raise_for_status()
-    return resp.json()
+    return _request("POST", f"/messenger/v1/accounts/{user_id}/chats/{chat_id}/messages",
+                    json={"message": {"text": text}, "type": "text"})
 
 
 def get_all_messages(user_id: int, chat_id: str) -> list:
