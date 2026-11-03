@@ -143,9 +143,9 @@ def _request_summary(a: dict) -> str:
     if a["postpones"]:
         return "просит отложить / не может сейчас"
     if a["day"] and (a["agrees"] or a["invited"]):
-        return f"согласен на пробный, хочет в {a['day']}"
+        return f"готов(а) на пробный, хочет в {a['day']}"
     if a["agrees"] and a["invited"]:
-        return "согласен на пробный урок"
+        return "готов(а) на пробный урок"
     if a["asks_price"]:
         return "спрашивает цену"
     if a["asks_format"]:

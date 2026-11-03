@@ -93,10 +93,11 @@ def _history_lines(dialog: list[dict], name: str) -> str:
     return "\n".join(lines)
 
 
-def _card_text(v: dict, dialog: list[dict] | None = None, phone: str | None = None) -> str:
+def _card_text(v: dict, dialog: list[dict] | None = None, phone: str | None = None,
+               title: str = "Новое сообщение на Avito") -> str:
     history = _history_lines(dialog or [], v["Имя"])
     return (
-        f"Новое сообщение на Avito\n"
+        f"{title}\n"
         f"От: {v['Имя']} ({v['Город']})\n"
         f"Категория: {v['Категория']}\n"
         + (f"📞 Телефон из переписки: {phone}\n" if phone else "")
@@ -493,38 +494,63 @@ def check_new_avito_messages(user_id: int) -> None:
         item = chat.get("context", {}).get("value", {})
         city = (item.get("location") or {}).get("title", "—")
         last_text = (last.get("content") or {}).get("text", "")
-
-        # смотрим всю переписку, а не одно последнее сообщение: класс, цель, о чём уже договорились
-        dialog = _load_dialog(user_id, chat["id"]) or [{"direction": "in", "text": last_text, "created": time.time()}]
-        a = analyze_dialog(dialog)
-        client_text = a["batch_text"] or last_text
-        category = category_text(a)
-        variants = generate_variants(name, client_text, slots_text, a)
-        draft = variants[0]
-
-        # один клиент — одна строка: если он уже писал, обновляем его строку, а старую карточку гасим
-        existing = sheets.find_contact_by_chat(chat["id"])
-        row_id = existing["values"]["id"] if existing and existing["values"]["id"] else sheets.new_row_id()
-        card = {"Имя": name, "Город": city, "Категория": category, "Сообщение клиента": client_text,
-                "Черновик ответа": draft}
-        sent = tg.send_message(ADMIN_ID, _card_text(card, dialog, a.get("phone")), reply_markup=_card_buttons(row_id))
-        print(f"NEW_MESSAGE: {name} ({city}) -> notified")
-        if existing and existing["values"]["id"]:
-            _retire_old_cards(row_id, existing["values"].get("telegram_msg_id"))
-            sheets.update_contact(row_id, {
-                "Дата": today_str(), "Время": _hhmm(), "Имя": name, "Город": city, "Категория": category,
-                "Сообщение клиента": client_text, "Черновик ответа": draft, "Статус": "ожидает",
-                "avito_msg_id": avito_msg_id, "telegram_msg_id": sent.get("message_id"),
-            })
-        else:
-            sheets.log_contact(chat["id"], avito_msg_id, name, city, category, client_text, draft,
-                               sent.get("message_id"), row_id=row_id)
-        sheets.set_state(f"var_{row_id}", json.dumps(variants, ensure_ascii=False))
-        sheets.set_state(f"card_{sent.get('message_id')}", row_id)
+        _notify_client(user_id, chat["id"], name, city, avito_msg_id, last_text, slots_text)
         seen_ids.add(avito_msg_id)
 
     if not bootstrapped:
         sheets.set_state("bootstrapped", "1")
+
+
+def _notify_client(user_id: int, chat_id: str, name: str, city: str, avito_msg_id: str, last_text: str,
+                   slots_text: str, title: str = "Новое сообщение на Avito", when: tuple | None = None) -> None:
+    # смотрим всю переписку, а не одно последнее сообщение: класс, цель, о чём уже договорились
+    dialog = _load_dialog(user_id, chat_id) or [{"direction": "in", "text": last_text, "created": time.time()}]
+    a = analyze_dialog(dialog)
+    client_text = a["batch_text"] or last_text
+    category = category_text(a)
+    variants = generate_variants(name, client_text, slots_text, a)
+    draft = variants[0]
+
+    # один клиент — одна строка: если он уже писал, обновляем его строку, а старую карточку гасим
+    existing = sheets.find_contact_by_chat(chat_id)
+    row_id = existing["values"]["id"] if existing and existing["values"]["id"] else sheets.new_row_id()
+    card = {"Имя": name, "Город": city, "Категория": category, "Сообщение клиента": client_text,
+            "Черновик ответа": draft}
+    sent = tg.send_message(ADMIN_ID, _card_text(card, dialog, a.get("phone"), title), reply_markup=_card_buttons(row_id))
+    print(f"NEW_MESSAGE: {name} ({city}) -> notified")
+    date, hhmm = when or (today_str(), _hhmm())
+    if existing and existing["values"]["id"]:
+        _retire_old_cards(row_id, existing["values"].get("telegram_msg_id"))
+        sheets.update_contact(row_id, {
+            "Дата": date, "Время": hhmm, "Имя": name, "Город": city, "Категория": category,
+            "Сообщение клиента": client_text, "Черновик ответа": draft, "Статус": "ожидает",
+            "avito_msg_id": avito_msg_id, "telegram_msg_id": sent.get("message_id"),
+        })
+    else:
+        sheets.log_contact(chat_id, avito_msg_id, name, city, category, client_text, draft,
+                           sent.get("message_id"), row_id=row_id)
+    sheets.set_state(f"var_{row_id}", json.dumps(variants, ensure_ascii=False))
+    sheets.set_state(f"card_{sent.get('message_id')}", row_id)
+
+
+REFRESH_VERSION = "dialog-v1"
+
+
+def refresh_pending_once(user_id: int) -> None:
+    """После перехода на разбор всей переписки: один раз пересчитать заявки, которые ждут ответа,
+    и прислать по ним новые карточки (у старых были неверная категория и черновик)."""
+    if sheets.get_state("refreshed", "") == REFRESH_VERSION:
+        return
+    sheets.set_state("refreshed", REFRESH_VERSION)  # сначала отметка — чтобы при сбое не слать карточки каждый час
+    pending = [c for c in sheets.all_contacts() if c["Статус"] == "ожидает" and c["Имя"] != "—"]
+    if not pending:
+        return
+    tg.send_message(ADMIN_ID, f"Пересчитал заявки, которые ждут ответа ({len(pending)}), с учётом всей переписки "
+                              "в Avito — новые карточки ниже, старые кнопки отключены.")
+    for c in pending:
+        _notify_client(user_id, c["chat_id"], c["Имя"], c["Город"], c["avito_msg_id"], c["Сообщение клиента"],
+                       today_slots(), title="Заявка ждёт ответа (обновлено по всей переписке)",
+                       when=(c["Дата"], c["Время"]))
 
 
 def _run_avito_check(user_id: int) -> None:
@@ -594,6 +620,11 @@ def main() -> None:
         if removed:
             sheets.set_state("last_dedupe", f"{_now()}: склеил повторы клиентов, убрал строк: {removed}")
     sheets.get_logged_msg_ids()  # прогреваем кэш таблицы до первых нажатий
+    if RUN_SECONDS:
+        try:
+            refresh_pending_once(user_id)
+        except Exception as e:
+            _note_error("пересчёт заявок", e)
     sheets.set_state("last_run", f"{_now()} ({host})")
     offset = int(sheets.get_state("telegram_last_update_id", "0") or "0")
     deadline = time.time() + RUN_SECONDS
