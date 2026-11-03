@@ -65,11 +65,21 @@ def _get_or_create_sheet(spreadsheet, name: str, headers: list):
         sheet.append_row(headers)
         _sheet_cache[name] = sheet
         return sheet
-    if sheet.row_values(1) != headers:
-        sheet.clear()
-        sheet.append_row(headers)
+    first = sheet.row_values(1)
+    if not first:
+        sheet.update(values=[headers], range_name="A1", value_input_option=RAW)
+    elif first != headers:
+        # Раньше здесь лист очищался целиком — так можно потерять все заявки. Теперь только останавливаемся.
+        raise RuntimeError(f"В листе «{name}» изменена первая строка (заголовки) — данные не трогаю. "
+                           f"Нужно: {', '.join(headers)}")
     _sheet_cache[name] = sheet
     return sheet
+
+
+def _find_row(sheet, value: str, col: int) -> int | None:
+    """Где строка с этим значением в колонке сейчас на самом деле (её могли сдвинуть, удалив строки вручную)."""
+    cell = sheet.find(value, in_column=col)  # gspread 5.x и 6.x: None, если не нашлось
+    return cell.row if cell else None
 
 
 _ss_cache = None
@@ -155,16 +165,35 @@ def find_contact_by_chat(chat_id: str) -> dict | None:
     return None
 
 
+def _reload_contacts() -> None:
+    global _contacts
+    _contacts = None
+    _load_contacts()
+
+
 def update_contact(row_id: str, fields: dict) -> None:
-    """Переписывает строку клиента одним запросом (новое сообщение того же клиента — та же строка)."""
+    """Переписывает строку клиента одним запросом (новое сообщение того же клиента — та же строка).
+    Перед записью проверяем, что по запомненному номеру всё ещё этот клиент: если строки удаляли или
+    двигали руками, номер сдвигается, и без проверки данные одного клиента легли бы поверх другого
+    (03.11 так пропала строка Веры)."""
     found = get_contact_by_id(row_id)
     if not found:
         return
-    row = _load_contacts()[found["row"]]
+    values = list(_load_contacts()[found["row"]])
     for k, v in fields.items():
-        row[_IDX[k]] = "" if v is None else str(v)
-    end_col = gspread.utils.rowcol_to_a1(found["row"], len(CONTACTS_HEADERS))
-    _contacts_sheet().update(values=[row], range_name=f"A{found['row']}:{end_col}", value_input_option=RAW)
+        values[_IDX[k]] = "" if v is None else str(v)
+    sheet = _contacts_sheet()
+    row_num = found["row"]
+    if sheet.cell(row_num, _IDX["id"] + 1).value != row_id:
+        _reload_contacts()
+        again = get_contact_by_id(row_id)
+        if not again:  # строку удалили вручную — не воскрешаем и, главное, не пишем в чужую
+            print(f"WARN: строки {row_id} больше нет в таблице — запись пропущена")
+            return
+        row_num = again["row"]
+    _load_contacts()[row_num] = values
+    end_col = gspread.utils.rowcol_to_a1(row_num, len(CONTACTS_HEADERS))
+    sheet.update(values=[values], range_name=f"A{row_num}:{end_col}", value_input_option=RAW)
 
 
 def dedupe_contacts() -> int:
@@ -180,6 +209,10 @@ def dedupe_contacts() -> int:
         if r[_IDX["chat_id"]]:
             groups.setdefault(r[_IDX["chat_id"]], []).append((i, r))
     to_delete = []
+    dup_rows = sum(len(items) - 1 for items in groups.values() if len(items) > 1)
+    if dup_rows > 5:
+        # столько повторов разом — признак сбоя, а не обычных дублей; удалять строки в таком случае опасно
+        raise RuntimeError(f"В «Обращениях» {dup_rows} повторов клиентов — склейку не делаю, нужна проверка")
     for items in groups.values():
         if len(items) < 2:
             continue
@@ -216,16 +249,10 @@ def mark_status_cached(row_id: str, status: str, new_draft: str | None = None) -
 
 
 def update_contact_status(row_id: str, status: str, new_draft: str | None = None) -> None:
-    found = get_contact_by_id(row_id)
-    if not found:
-        return
-    row = found["row"]
-    cached = _load_contacts()[row]
-    cached[_IDX["Статус"]] = status
-    _set_cell(_contacts_sheet(), row, CONTACTS_HEADERS.index("Статус") + 1, status)
+    fields = {"Статус": status}
     if new_draft is not None:
-        cached[_IDX["Черновик ответа"]] = new_draft
-        _set_cell(_contacts_sheet(), row, CONTACTS_HEADERS.index("Черновик ответа") + 1, new_draft)
+        fields["Черновик ответа"] = new_draft
+    update_contact(row_id, fields)
 
 
 _bookings = None  # строки листа «Записаны на пробный» (в памяти, как и остальные листы)
@@ -272,12 +299,18 @@ def get_state(key: str, default: str = "") -> str:
 
 
 def set_state(key: str, value: str) -> None:
+    global _state
     state = _load_state()
     found = state.get(key)
     if found:
         if found[1] == value:
             return
-        _set_cell(_state_sheet(), found[0], 2, value)
+        sheet = _state_sheet()
+        if sheet.cell(found[0], 1).value != key:  # строки сдвинули руками — перечитываем, а не пишем мимо
+            _state = None
+            set_state(key, value)
+            return
+        _set_cell(sheet, found[0], 2, value)
         found[1] = value
         return
     row_num = _append(_state_sheet(), [key, value]) or (max((v[0] for v in state.values()), default=1) + 1)
