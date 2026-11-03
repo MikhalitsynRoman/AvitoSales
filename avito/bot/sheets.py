@@ -179,18 +179,22 @@ def update_contact(row_id: str, fields: dict) -> None:
     found = get_contact_by_id(row_id)
     if not found:
         return
-    values = list(_load_contacts()[found["row"]])
-    for k, v in fields.items():
-        values[_IDX[k]] = "" if v is None else str(v)
     sheet = _contacts_sheet()
     row_num = found["row"]
-    if sheet.cell(row_num, _IDX["id"] + 1).value != row_id:
+    width = len(CONTACTS_HEADERS)
+    current = (sheet.row_values(row_num) + [""] * width)[:width]
+    if current[_IDX["id"]] != row_id:
         _reload_contacts()
         again = get_contact_by_id(row_id)
         if not again:  # строку удалили вручную — не воскрешаем и, главное, не пишем в чужую
             print(f"WARN: строки {row_id} больше нет в таблице — запись пропущена")
             return
         row_num = again["row"]
+        current = (sheet.row_values(row_num) + [""] * width)[:width]
+    # за основу — то, что сейчас в таблице: ручные правки Романа в других ячейках сохраняются
+    values = list(current)
+    for k, v in fields.items():
+        values[_IDX[k]] = "" if v is None else str(v)
     _load_contacts()[row_num] = values
     end_col = gspread.utils.rowcol_to_a1(row_num, len(CONTACTS_HEADERS))
     sheet.update(values=[values], range_name=f"A{row_num}:{end_col}", value_input_option=RAW)
