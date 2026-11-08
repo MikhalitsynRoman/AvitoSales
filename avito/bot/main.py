@@ -40,6 +40,7 @@ HELP_TEXT = (
 # Статистика процесса для /status (в памяти, сбрасывается при перезапуске)
 _stats = {"started": "", "host": "", "last_check": 0.0, "check_secs": 0.0, "avito_fails": 0, "errors": []}
 _variant_msgs = {}  # row_id -> message_id уже открытого экрана вариантов (чтобы не слать его повторно)
+_notified_msgs = set()  # id сообщений Avito, по которым карточка уже ушла в этом процессе
 
 
 def _now() -> str:
@@ -639,6 +640,11 @@ def check_new_avito_messages(user_id: int) -> None:
         item = chat.get("context", {}).get("value", {})
         city = (item.get("location") or {}).get("title", "—")
         last_text = (last.get("content") or {}).get("text", "")
+        # Одно сообщение клиента — одна карточка, что бы ни случилось с таблицей: 08.11 из-за сбоя записи
+        # в таблицу бот не узнавал заявку и присылал её каждую минуту (~1500 карточек).
+        if avito_msg_id in _notified_msgs:
+            continue
+        _notified_msgs.add(avito_msg_id)
         _notify_client(user_id, chat["id"], name, city, avito_msg_id, last_text, slots_text)
         seen_ids.add(avito_msg_id)
 
@@ -798,6 +804,14 @@ def main() -> None:
         if removed:
             sheets.set_state("last_dedupe", f"{_now()}: склеил повторы клиентов, убрал строк: {removed}")
     sheets.get_logged_msg_ids()  # прогреваем кэш таблицы до первых нажатий
+    # уже отправленные карточки (есть в таблице) второй раз не шлём и после перезапуска
+    _notified_msgs.update(sheets.get_logged_msg_ids())
+    if RUN_SECONDS and len(sheets._load_state()) > 1500:
+        try:
+            cleaned = sheets.compact_state({c["id"] for c in sheets.all_contacts() if c["id"]})
+            sheets.set_state("last_compact", f"{_now()}: убрал служебных строк: {cleaned}")
+        except Exception as e:
+            _note_error("уборка «Состояния»", e)
     if RUN_SECONDS:
         try:
             refresh_pending_once(user_id)

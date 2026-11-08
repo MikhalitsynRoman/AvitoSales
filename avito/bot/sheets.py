@@ -48,11 +48,16 @@ def _set_cell(sheet, row: int, col: int, value: str) -> None:
 
 
 def _append(sheet, values: list) -> int:
-    """Дописывает строку и возвращает её номер (берём из ответа Google, а не считаем сами)."""
-    resp = sheet.append_row(values, value_input_option=RAW)
-    rng = (resp or {}).get("updates", {}).get("updatedRange", "")
-    m = re.search(r"![A-Z]+(\d+)", rng)
-    return int(m.group(1)) if m else 0
+    """Дописывает строку в первую пустую строку после последней заполненной и возвращает её номер.
+    append_row от Google здесь не используем: 08.11 он раз за разом писал в строку 13 ПОВЕРХ существующей
+    заявки (проверено на копии листа) — две заявки затирали друг друга, и бот слал карточку каждую минуту."""
+    row_num = len(sheet.col_values(1)) + 1  # в колонке A всегда что-то есть: дата или ключ
+    if row_num > sheet.row_count:
+        sheet.add_rows(200)
+    if any(c.strip() for c in sheet.row_values(row_num)):  # страховка: в занятую строку не пишем
+        raise RuntimeError(f"Строка {row_num} листа «{sheet.title}» неожиданно занята — не записываю поверх")
+    sheet.update(values=[values], range_name=f"A{row_num}", value_input_option=RAW)
+    return row_num
 
 
 def _get_or_create_sheet(spreadsheet, name: str, headers: list):
@@ -274,7 +279,7 @@ def log_booking(name: str, phone: str, chat_id: str, when: str, goal: str) -> No
     """when — «05.11.2026 16:30»: по нему бот понимает, что это окно занято."""
     bookings = get_bookings()
     row = [datetime.now().strftime("%d.%m.%Y %H:%M"), name or "—", phone or "—", chat_id, when or "—", goal or "—"]
-    _get_or_create_sheet(_spreadsheet(), BOOKINGS_SHEET, BOOKINGS_HEADERS).append_row(row, value_input_option=RAW)
+    _append(_get_or_create_sheet(_spreadsheet(), BOOKINGS_SHEET, BOOKINGS_HEADERS), row)
     bookings.append(dict(zip(BOOKINGS_HEADERS, row)))
 
 # ---------- состояние (ключ -> значение) ----------
@@ -295,6 +300,31 @@ def _load_state() -> dict:
             if r and r[0] and r[0] not in _state:
                 _state[r[0]] = [i, r[1] if len(r) > 1 else ""]
     return _state
+
+
+def compact_state(keep_row_ids: set) -> int:
+    """Убирает служебные ключи заявок, которых больше нет в «Обращениях» (var_/meta_/vardate_/card_),
+    и пустые txt_. Вызывать только при старте бота. Возвращает, сколько строк убрано."""
+    global _state
+    sheet = _state_sheet()
+    rows = sheet.get_all_values()[1:]
+    keep, seen = [], set()
+    for r in rows:
+        key, value = (r[0] if r else ""), (r[1] if len(r) > 1 else "")
+        if not key or key in seen:
+            continue
+        m = re.match(r"(var|meta|vardate)_(\w+)$", key)
+        if (m and m.group(2) not in keep_row_ids) or (key.startswith("card_") and value not in keep_row_ids) \
+                or (key.startswith("txt_") and not value):
+            continue
+        seen.add(key)
+        keep.append([key, value])
+    removed = len(rows) - len(keep)
+    if removed > 0:
+        sheet.update(values=[STATE_HEADERS] + keep, range_name="A1", value_input_option=RAW)
+        sheet.batch_clear([f"A{len(keep) + 2}:B{len(rows) + 1}"])
+    _state = None
+    return removed
 
 
 def get_state(key: str, default: str = "") -> str:
