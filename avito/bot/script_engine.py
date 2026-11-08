@@ -22,9 +22,12 @@ DECLINE_TIME_RE = re.compile(r"не\s+удобно|неудобно|не\s+по�
 # Клиент отказался — не уговариваем и не зовём на пробный, вежливо прощаемся и оставляем дверь открытой
 REFUSE_RE = re.compile(r"уже\s+(нашл|наш[её]л|записал|занима|есть\s+репет)|нашли\s+друг|к\s+другому|другого\s+репет"
                        r"|нашли\s+репет|не\s+нужн|уже\s+не\s+над|не\s+актуальн|неактуальн|передумал|не\s+интерес"
+                       r"|не\s+хоч(у|ем)|не\s+хотим|не\s+будем|не\s+планир"
                        r"|откаж|^\s*(нет,?\s+спасибо|не надо)\s*[.!]*\s*$", re.I)
 # Голое «нет» — отказ, только если мы не спрашивали про время; на «будет удобно завтра в 12:00?» это «время не подходит»
 BARE_NO_RE = re.compile(r"^\s*(нет|неь|не|нит|неа)\s*[.!]*\s*$", re.I)
+ILL_RE = re.compile(r"боле(е|ет|ю|ла|л)|заболе|нездоров|температур|простыл|в больниц", re.I)
+WILL_WRITE_RE = re.compile(r"напиш(у|ем)|сообщ(у|им)|отпиш(у|емся)|дам знать|свяжусь|свяжемся", re.I)
 # Реклама/спам от сервисов (ссылки, «попробуйте наш…») — отвечать не нужно
 SPAM_RE = re.compile(r"https?://|www\.|попробуйте\s+(провести|наш|сервис)|наш[аи]?\s+(платформ|сервис)", re.I)
 POSTPONE_RE = re.compile(r"боле(е|ет|ю|ла|л)|заболе|температур|перенес|не смож|не получ|позже|потом напиш|подума", re.I)
@@ -230,7 +233,8 @@ def day_label(d: date, today: date) -> str:
         return "сегодня"
     if d == today + timedelta(days=1):
         return "завтра"
-    return f"в {WEEKDAY_NAMES[d.weekday()]}, {d.day} {MONTHS[d.month - 1]}"
+    prep = "во" if d.weekday() == 1 else "в"  # «во вторник»
+    return f"{prep} {WEEKDAY_NAMES[d.weekday()]}, {d.day} {MONTHS[d.month - 1]}"
 
 
 def booking_key(d: date, hhmm: str) -> str:
@@ -383,6 +387,16 @@ def generate_variants(client_name: str, client_text: str, slots_text: str = "", 
 
     # 1. Уже записан (ссылку отправляли) — подтверждаем, при просьбе — переносим
     if a["link_sent"] and not a["confirmed"]:
+        ill = bool(ILL_RE.search(a["batch_text"]))
+        if a["postpones"] and WILL_WRITE_RE.search(a["batch_text"]):
+            # клиент сам обещал написать позже — не спрашиваем время, а спокойно ждём
+            when = f" {day_label(a['day'], today)}" if a["day"] else ""
+            wish = "Выздоравливайте! " if ill else ""
+            return [
+                _say(o, f"Конечно, перенесём! {wish}Буду ждать вашего сообщения{when} — подберём удобное время."),
+                _say(o, f"Хорошо, без проблем. {wish}Напишите{when}, как будет удобно, — договоримся о времени."),
+                _say(o, f"Понял вас, перенесём. {wish}Жду вашего сообщения{when}!"),
+            ]
         if a["postpones"] or a["declines_time"]:
             return [
                 _say(o, "Конечно, перенесём!", _time_question(slots, a)),

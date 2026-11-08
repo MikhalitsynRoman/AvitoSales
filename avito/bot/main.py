@@ -610,6 +610,7 @@ def check_new_avito_messages(user_id: int) -> None:
     for chat in chats:
         last = chat.get("last_message") or {}
         if last.get("direction") != "in":
+            _mark_answered_in_avito(chat["id"])
             continue
         avito_msg_id = last.get("id", "")
         if not avito_msg_id or avito_msg_id in seen_ids:
@@ -650,6 +651,20 @@ def check_new_avito_messages(user_id: int) -> None:
 
     if not bootstrapped:
         sheets.set_state("bootstrapped", "1")
+
+
+def _mark_answered_in_avito(chat_id: str) -> None:
+    """Последнее сообщение в чате наше, а заявка всё ещё «ожидает» — значит, Роман ответил прямо в Avito.
+    Отмечаем это и гасим кнопки карточки, иначе «Отправить» ушёл бы клиенту вторым ответом."""
+    existing = sheets.find_contact_by_chat(chat_id)
+    if not existing or existing["values"]["Статус"] != "ожидает":
+        return
+    v = existing["values"]
+    sheets.update_contact(v["id"], {"Статус": "отвечено (в Avito)"})
+    for msg_id in {v.get("telegram_msg_id"), _variant_msgs.pop(v["id"], None)}:
+        if msg_id:
+            tg.edit_message_reply_markup(ADMIN_ID, int(msg_id), tg.inline_keyboard(
+                [("✍️ Вы уже ответили в Avito", "noop")]))
 
 
 def _notify_client(user_id: int, chat_id: str, name: str, city: str, avito_msg_id: str, last_text: str,
@@ -717,7 +732,7 @@ def skip_old_pending_once(user_id: int) -> None:
                                   + "\n\nЕсли кому-то хотите написать — ответьте (reply) на его карточку.")
 
 
-REFRESH_VERSION = "dialog-v1"
+REFRESH_VERSION = "dialog-v2"  # v2 (08.11): «не хочу» = отказ, «напишу во вторник» = ждём, без вопроса о времени
 
 
 def refresh_pending_once(user_id: int) -> None:
@@ -798,7 +813,15 @@ def main() -> None:
     _stats["host"] = "хостинг reg.ru" if "reg.ru" in host else host
     _stats["started"] = _now()
     sheets.set_state("last_start", f"{_now()} ({host})")
-    user_id = avito_client.get_self_account()["id"]
+    # 06.11 бот упал при запуске на коротком обрыве связи с Avito — даём ему три попытки, а не одну
+    for attempt in range(3):
+        try:
+            user_id = avito_client.get_self_account()["id"]
+            break
+        except Exception:
+            if attempt == 2:
+                raise
+            time.sleep(10)
     if RUN_SECONDS:  # только на хостинге: склейка удаляет строки, второй процесс сбил бы номера строк
         removed = sheets.dedupe_contacts()
         if removed:
