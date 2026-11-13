@@ -597,8 +597,8 @@ def handle_message(user_id: int, msg: dict) -> None:
                     _cancel_auto(rid)
         state = "включён" if _auto_enabled() else "выключен"
         tg.send_message(ADMIN_ID, f"🤖 Автоответ {state}.\n"
-                                  f"Когда включён: в понятных ситуациях отвечаю клиенту сам через {AUTO_DELAY // 60} мин "
-                                  "после карточки (успеете нажать «Не отправлять»); остальное — вам.\n"
+                                  "Когда включён: в понятных ситуациях отвечаю клиенту сам сразу и присылаю вам карточку "
+                                  "с тем, что ответил; нестандартное — вам.\n"
                                   "/auto on — включить, /auto off — выключить.")
         return
 
@@ -818,10 +818,10 @@ def _mark_answered_in_avito(chat_id: str) -> None:
 
 # ---------- автоответ ----------
 # Роман просил отвечать клиентам без него. Бот отвечает сам только там, где ситуация распознана уверенно
-# (script_engine.auto_decision), через AUTO_DELAY после карточки — чтобы Роман успел нажать «Не отправлять»,
+# (script_engine.auto_decision), через AUTO_DELAY после карточки (0 — сразу; при задержке есть «Не отправлять»),
 # и в жёстких лимитах: сбой не должен превратиться в рассылку клиентам (08.11 сбой таблицы дал 1500 карточек).
 
-AUTO_DELAY = 120
+AUTO_DELAY = 0  # 14.11 Роман попросил отвечать сразу (было 120 с на «Не отправлять»)
 AUTO_MAX_PER_CHAT_DAY = 5
 AUTO_MAX_PER_HOUR = 20
 _pending_auto = {}   # row_id -> {"due", "chat_id", "msg_id", "text", "card"}
@@ -948,11 +948,13 @@ def _notify_client(user_id: int, chat_id: str, name: str, city: str, avito_msg_i
         auto_ok, why = auto_decision(a, ", ".join(free_slots_today()), schedule())
         if auto_ok:
             auto_ok, why = _auto_limits_ok(chat_id, a, existing)
-    card_text = _card_text(card, dialog, a.get("phone"), "🤖 " + title + f" — отвечу сам через {AUTO_DELAY // 60} мин"
-                           if auto_ok else title)
+    auto_title = (f" — отвечу сам через {AUTO_DELAY // 60} мин" if AUTO_DELAY else " — отвечаю сам")
+    card_text = _card_text(card, dialog, a.get("phone"), "🤖 " + title + auto_title if auto_ok else title)
     if allow_auto and _auto_enabled() and not auto_ok and why:
         card_text += f"\n\n✋ Нужен ваш ответ: {why}"
-    sent = tg.send_message(ADMIN_ID, card_text, reply_markup=_auto_buttons(row_id) if auto_ok else _card_buttons(row_id))
+    # без задержки отменять нечего — кнопки обычные (останутся, только если отправка вдруг не удалась)
+    buttons = _auto_buttons(row_id) if auto_ok and AUTO_DELAY else _card_buttons(row_id)
+    sent = tg.send_message(ADMIN_ID, card_text, reply_markup=buttons)
     if auto_ok:
         _schedule_auto(row_id, chat_id, avito_msg_id, draft, sent.get("message_id"))
     print(f"NEW_MESSAGE: {name} ({city}) -> notified")
@@ -971,6 +973,9 @@ def _notify_client(user_id: int, chat_id: str, name: str, city: str, avito_msg_i
     sheets.set_state(f"card_{sent.get('message_id')}", row_id)
     sheets.set_state(f"vardate_{row_id}", today_str())
     _save_meta(row_id, a)
+    if auto_ok and not AUTO_DELAY and row_id in _pending_auto:
+        # отвечаем сразу — уже после того, как заявка и время записи сохранены в таблицу
+        _send_auto(user_id, row_id, _pending_auto[row_id])
 
 
 OLD_MESSAGE_SECONDS = 48 * 3600
