@@ -5,7 +5,7 @@ MSK = timezone(timedelta(hours=3))
 
 PRICE_RE = re.compile(r"сто(ит|ят|имость)|\bцен[аыу]\b|сколько.*(сто|плат)|оплат|прайс|фикс", re.I)
 FORMAT_RE = re.compile(r"\bочно\b|\bонлайн\b|удал[её]нн|как\s+(проход|занима)|где\s+занят|формат", re.I)
-CLASS_RE = re.compile(r"(\d{1,2})\s*-?\s*(?:й|ый|ой)?\s*кл", re.I)
+CLASS_RE = re.compile(r"(\d{1,2})\s*-?\s*(?:й|ый|ой|х|ых|ти|ом)?\s*кл", re.I)
 BARE_NUMBER_RE = re.compile(r"^\s*(\d{1,2})\s*[.!)]*\s*$")
 EGE_RE = re.compile(r"егэ|профил", re.I)
 OGE_RE = re.compile(r"огэ", re.I)
@@ -40,6 +40,40 @@ MONTHS = ["января", "февраля", "марта", "апреля", "ма�
 
 TIME_RE = re.compile(r"\b\d{1,2}[:.]\d{2}\b")
 
+# Частые вопросы клиентов (по переписке Романа и методичке)
+PHONE_Q_RE = re.compile(r"с\s+телефон|через\s+телефон|телефона\s+можно|ноутбук|компьютер\w*\s+(нет|слома)", re.I)
+DURATION_Q_RE = re.compile(r"сколько\s+(длит|продолж|идет|идёт|по\s+времени)|продолжительн|сколько\s+минут", re.I)
+GROUP_Q_RE = re.compile(r"индивидуальн|в\s+групп|группов|мини-?групп|один\s+на\s+один|1\s+на\s+1|несколькими", re.I)
+HOMEWORK_Q_RE = re.compile(r"домашн|д/з|\bдз\b", re.I)
+PAY_Q_RE = re.compile(r"оплат\w*\s+(за\s+кажд|раз\s+в\s+мес|помесячн)|оплачива\w*\s+(отдельно|кажд|за\s+кажд)|абонемент|как\s+(оплат|платит)|раз\s+в\s+м[еяи]сяц\s+плат",
+                      re.I)
+MESSENGER_Q_RE = re.compile(r"\bмакс\b|\bmax\b|ватсап|whatsapp|вотсап|телеграм|телеграмм|\bтг\b|вайбер|viber|"
+                            r"ваш\s+(номер|телефон)|дайте\s+(номер|телефон)|номер\s+телефона\?", re.I)
+# «занимаетесь с 5 классом?», «берёте 7 класс?»
+TAKE_GRADE_Q_RE = re.compile(r"занимаетесь|бер[её]те|работаете|преподаете|преподаёте|подготавливаете|возьм[её]те", re.I)
+# клиент прислал только номер телефона (обычно в ответ на просьбу Avito оставить номер)
+PHONE_ONLY_RE = re.compile(r"^[\s+()\-\d]{10,18}$")
+THINK_RE = re.compile(r"подума(ю|ем|ть)|посовету(юсь|емся)|обсуд(им|им с)|решим\s+и\s+напиш|будем\s+думать", re.I)
+OFFLINE_ONLY_RE = re.compile(r"только\s+очно|ищ(у|ем)\s+(оффлайн|офлайн|очно)|хоч\w*\s+очно|на\s+дому|к\s+вам\s+приход|"
+                             r"приходить\s+к|адрес|в\s+посёлке|в\s+поселке", re.I)
+# Клиент на связи по уроку (подключается, ждёт, не может зайти) — это момент урока, отвечает только Роман
+CONNECT_RE = re.compile(r"не\s+получа|не\s+могу\s+(зайти|войти|подключ)|не\s+открыва|зарегистр|регистрац|мы\s+(вас\s+)?ждём|"
+                        r"мы\s+(вас\s+)?ждем|я\s+(вас\s+)?жду|подключаемся|состоится|вы\s+где|где\s+вы|комнате\s+ожидан|"
+                        r"ну\s+что\b|я\s+зашел|я\s+зашёл|не\s+пускает|не\s+слышно|не\s+видно", re.I)
+# «12000 — это за сколько занятий?»
+PRICE_DETAIL_RE = re.compile(r"за\s+сколько\s+(занят|урок)|сколько\s+(занятий|уроков)\s+в\s+(месяц|неделю)|это\s+в\s+месяц|"
+                             r"за\s+месяц\?|за\s+час\?", re.I)
+PRICE_DETAIL_ANSWER = ("Это средний расчёт на 8 занятий в месяц, может быть и меньше — всё зависит от количества занятий "
+                       "в неделю, а это определим по текущим знаниям ученика на пробном уроке.")
+# Короткое «ок/спасибо/до встречи» — на это бот может ответить сам и после записи
+ACK_RE = re.compile(r"^\W*(ок|окей|хорошо|спасибо|спс|понял|поняла|понятно|до\s+встречи|отлично|супер|ладно|договорились)"
+                    r"[\s!.,)👍🙏]*(спасибо|до\s+встречи)?[\s!.,)👍🙏]*$", re.I)
+# С этим бот сам не справится — только карточка Роману, без автоответа
+MANUAL_ONLY_RE = re.compile(r"реш(ить|ите|и|ать)\b.{0,25}(задач|контрольн|тест|вариант|домашк)|контрольн\w*\s+(работ|завтра)|"
+                            r"сессия|высш\w+\s+мат|"
+                            r"вуз|институт|универ|колледж|олимпиад|обман|жалоб|плох\w+\s+отзыв|верните|хамств|ужас|позор|"
+                            r"мошенн|деньги\s+назад", re.I)
+
 # ---------- тексты Романа (дословно) ----------
 
 # Ссылка Zoom с паролем — не в коде (репозиторий публичный): хранится в закрытой таблице, ключ zoom_link,
@@ -65,9 +99,30 @@ def confirm_block(zoom_link: str) -> str:
     )
 
 FORMAT_ANSWER = "Занятия проходят онлайн в Zoom — можно заниматься из дома, из любого города."
-PRICE_ANSWER_DEFAULT = ("Стоимость зависит от частоты занятий и целей подготовки — точно сориентирую на пробном уроке, "
-                        "когда посмотрю уровень.")
 PLACES_ANSWER = "Да, есть свободные места."
+
+# Цена — ступенями, как в методичке и переписке Романа: сначала без цифр, на повторный вопрос — ориентир,
+# на настойчивый — абонемент. Ступень выбирается по тому, что уже говорили в этом чате.
+PRICE_STEP_1 = ("Стоимость занятий зависит от многих факторов: частоты занятий, формы оплаты, начального уровня и целей "
+                "подготовки. Более подробно смогу сориентировать после бесплатного пробного урока, куда вас и приглашаю 😊")
+PRICE_STEP_3 = ("Стоимость абонемента моих занятий — 12000 ₽ в месяц; если учитывать дополнительные занятия с ответами "
+                "на вопросы в индивидуальном формате, это примерно 660 ₽ в час.")
+OFFLINE_ANSWER = ("Я готовлю к экзаменам только онлайн. Это и экономия времени, и более эффективные занятия благодаря "
+                  "наглядности материала и презентациям. Так как мы занимаемся с камерой, мы видим друг друга через экран — "
+                  "фактически ничем не отличается от очных занятий 😊")
+FAQ_ANSWERS = {
+    "phone_q": "Да, с телефона тоже можно подключиться.",
+    "duration_q": "Пробное занятие займёт около 30 минут.",
+    "group_q": "Пробное занятие проходит индивидуально.",
+    "homework_q": ("Да, конечно, обязательно даю домашнее задание для закрепления каждой темы и детально его проверяю, "
+                   "чтобы понимать, что нужно исправить и улучшить."),
+    "pay_q": "Оплата — раз в месяц абонементом, в начале месяца; возможны и другие форматы, обсудим на пробном.",
+    "messenger_q": "Занятия проходят в Zoom, а общаться можем здесь или в Телеграме: @roma_math",
+}
+THINK_ANSWER = "Скажите, пожалуйста, над чем нужно подумать? Пробное занятие бесплатное и ни к чему вас не обязывает 😊"
+# Обещания по результатам — из методички Романа, дословно
+RESULT_EGE = "Вполне реально! В 2024 году каждый второй мой ученик сдал ЕГЭ на 80+."
+RESULT_OGE = "Вполне реально! В 2025 году ни один мой ученик не сдал ОГЭ ниже «4»."
 
 
 # ---------- разбор всей переписки ----------
@@ -82,6 +137,9 @@ def analyze_dialog(messages: list[dict], now: datetime | None = None) -> dict:
     (сообщения после нашего последнего ответа)."""
     now = now or datetime.now(MSK)
     msgs = [m for m in messages if (m.get("text") or "").strip()]
+    # служебные сообщения Avito («Пользователь попросил вас позвонить…») приходят как входящие — это не слова клиента
+    sys_in = [m for m in msgs if m["direction"] == "in" and m["text"].lstrip().startswith("[Системное сообщение]")]
+    msgs = [m for m in msgs if m not in sys_in]
     client_msgs = [m for m in msgs if m["direction"] == "in"]
     our_msgs = [m for m in msgs if m["direction"] == "out" and not m.get("system")]
 
@@ -177,8 +235,10 @@ def analyze_dialog(messages: list[dict], now: datetime | None = None) -> dict:
         # здороваемся, только если с нашего последнего сообщения прошло больше 12 часов
         "need_greeting": not our_last or (now - _dt(our_last["created"])) > timedelta(hours=12),
         "agrees": agrees,
-        "declines_time": bool(DECLINE_TIME_RE.search(batch_text)) or (bare_no and asked_time),
-        "postpones": bool(POSTPONE_RE.search(batch_text)),
+        "declines_time": bool(DECLINE_TIME_RE.search(batch_text)) or (asked_time and (bare_no or bool(
+            re.match(r"^\W*нет\b", batch_text, re.I)) and not REFUSE_RE.search(batch_text))),
+        # «не получится, только в понедельник» — это просьба о другом дне, а не «отложить»
+        "postpones": bool(POSTPONE_RE.search(batch_text)) and not (day and not ILL_RE.search(batch_text)),
         "asks_price": bool(PRICE_RE.search(batch_text)),
         "asks_format": bool(FORMAT_RE.search(batch_text)),
         "wants_record": bool(RECORD_RE.search(batch_text)),
@@ -189,6 +249,28 @@ def analyze_dialog(messages: list[dict], now: datetime | None = None) -> dict:
         "declined": bool(REFUSE_RE.search(batch_text)) or (bare_no and not asked_time),
         "spam": bool(SPAM_RE.search(batch_text)),
         "now": now,
+        # вопросы из методички
+        **{k: bool(rx.search(batch_text)) for k, rx in (
+            ("phone_q", PHONE_Q_RE), ("duration_q", DURATION_Q_RE), ("group_q", GROUP_Q_RE),
+            ("homework_q", HOMEWORK_Q_RE), ("pay_q", PAY_Q_RE), ("messenger_q", MESSENGER_Q_RE),
+            ("thinks", THINK_RE), ("offline_only", OFFLINE_ONLY_RE), ("manual_only", MANUAL_ONLY_RE))},
+        # что уже говорили — чтобы не повторяться и идти по ступеням
+        # 1 — ещё ничего не говорили, 2 — уже сказали «зависит от…», 3 — уже называли цифру (дальше — абонемент)
+        "price_step": 3 if (our_price or any(re.search(r"12\s?000|абонемент", m["text"]) for m in our_msgs))
+        else 2 if any("зависит от" in m["text"].lower() for m in our_msgs) else 1,
+        "results_said": any("вполне реально" in m["text"].lower() for m in our_msgs),
+        "compare_tried": any("сравните" in m["text"].lower() for m in our_msgs),
+        "our_times": our_times,
+        "our_last_text": our_last["text"] if our_last else "",
+        "our_last_ts": our_last["created"] if our_last else 0,
+        "batch_len": len(batch_text),
+        "call_request": bool(sys_in and "позвонить" in sys_in[-1]["text"]
+                             and (not msgs or sys_in[-1]["created"] >= msgs[-1]["created"])),
+        "connecting": bool(CONNECT_RE.search(batch_text)),
+        "price_detail_q": bool(PRICE_DETAIL_RE.search(batch_text)),
+        "ack_only": bool(ACK_RE.match(batch_text)),
+        "gave_phone": bool(batch) and all(PHONE_ONLY_RE.match(m["text"].strip()) or not m["text"].strip() for m in batch[-1:]),
+        "take_grade_q": bool(grade and grade.isdigit() and int(grade) <= 8 and TAKE_GRADE_Q_RE.search(batch_text)),
     }
 
 
@@ -323,13 +405,32 @@ def _answers(a: dict, price_hint: str) -> list[str]:
     if a["wants_record"]:
         out.append(PLACES_ANSWER)
     if a["asks_price"]:
+        step = a.get("price_step", 1)
         price = price_hint or (f"около {a['price_told']}" if a["price_told"] else "")
-        out.append(f"По стоимости — {price}, точнее сориентирую на бесплатном пробном уроке, когда посмотрю уровень "
-                   "и цели."
-                   if price else PRICE_ANSWER_DEFAULT)
-    if a["asks_format"]:
+        if step >= 3:
+            out.append(PRICE_STEP_3)
+        elif step == 2 and price:
+            out.append(f"Мои занятия стоят {price}, всё зависит от формата, частоты и способа оплаты. После пробного урока "
+                       "смогу сказать, какой формат подойдёт больше всего с учётом ситуации и пробелов 😊")
+        else:
+            out.append(PRICE_STEP_1)
+    if a.get("offline_only"):
+        out.append(OFFLINE_ANSWER)
+    elif a["asks_format"]:
         out.append(FORMAT_ANSWER)
-    return out
+    if a.get("gave_phone"):
+        out.insert(0, "Спасибо!")
+    if a.get("take_grade_q"):
+        out.append(f"Да, смогу вам помочь с {a['grade']} классом 😊")
+    if a.get("price_detail_q"):
+        out.append(PRICE_DETAIL_ANSWER)
+    for key, text in FAQ_ANSWERS.items():
+        if a.get(key):
+            out.append(text)
+    # цель уже известна, а «вполне реально» ещё не говорили — как в методичке, перед приглашением
+    if a["target"] and not a.get("results_said") and not a["has_our_msgs"]:
+        out.append(RESULT_OGE if a["category"] == "ОГЭ" else RESULT_EGE if a["category"] == "ЕГЭ" else "")
+    return [x for x in out if x]
 
 
 def _value_line(a: dict) -> str:
@@ -371,12 +472,24 @@ def generate_variants(client_name: str, client_text: str, slots_text: str = "", 
     # окна «сегодня» — только будущие, даже если кто-то передал список с прошедшими
     slots = [s for s in (x.replace(".", ":").zfill(5) for x in TIME_RE.findall(slots_text or ""))
              if not is_past(today, s, a["now"])]
+    if a.get("declines_time"):  # от предложенного времени отказались — его больше не предлагаем
+        slots = [s for s in slots if s not in a.get("our_times", [])]
     o = _greeting(client_name, a)
     answers = _answers(a, price_hint)
 
     # 0. Реклама или отказ — не продаём: на рекламу коротко, отказавшимся — вежливо, без приглашения
     if a["spam"]:
         return ["Спасибо, не интересует.", "Спасибо, но не актуально.", "Спасибо, нам не подходит."]
+    found_other = bool(re.search(r"нашл|наш[её]л|друг\w*\s+репет|к\s+другому|записал", a["batch_text"], re.I))
+    compare_tried = "сравните" in a.get("our_last_text", "").lower() or a.get("compare_tried", False)
+    if a["declined"] and found_other and a["invited"] and not compare_tried:
+        # как Роман: одна мягкая попытка — сравнить на бесплатном пробном; на повторный отказ уже прощаемся
+        return [
+            _say(o, "Понимаю! Приходите на бесплатный пробный урок — сравните и примете решение, с кем лучше "
+                    "заниматься. Он ни к чему не обязывает 😊"),
+            _say(o, "Рад, что нашли! Если захотите сравнить подходы — бесплатный пробный урок в силе, приходите 😊"),
+            _say(o, "Понял вас, спасибо, что ответили! Если понадобится помощь — пишите, буду рад помочь. Удачи на экзамене!"),
+        ]
     if a["declined"]:
         return [
             _say(o, "Понял вас, спасибо, что ответили! Если понадобится помощь с математикой — пишите, буду рад "
@@ -437,6 +550,15 @@ def generate_variants(client_name: str, client_text: str, slots_text: str = "", 
             confirm_block(zoom_link) + f"\n\nЖду вас {when}! Если планы изменятся — напишите, перенесём.",
         ]
 
+    # 3а. «Подумаем» — ответ Романа на это возражение, и снова предлагаем время
+    if a.get("thinks") and not ILL_RE.search(a["batch_text"]):
+        return [
+            _say(o, *answers, THINK_ANSWER, _time_question(slots, a)),
+            _say(o, *answers, "Конечно! Пробный урок как раз поможет принять решение: он бесплатный, длится около "
+                              "30 минут и ни к чему не обязывает.", _time_question(slots, a)),
+            _say(o, *answers, "Хорошо! Если появятся вопросы — пишите, с радостью отвечу 😊"),
+        ]
+
     # 3. Не может сейчас (заболел, просит позже) — не давим, оставляем дверь открытой
     if a["postpones"]:
         return [
@@ -459,8 +581,9 @@ def generate_variants(client_name: str, client_text: str, slots_text: str = "", 
 
     # 5. Уже приглашали, клиент согласен / назвал день — сразу предлагаем конкретное время
     if a["invited"] and (a["agrees"] or a["day"] or a["declines_time"]):
+        starts_no = bool(re.match(r"^\W*(нет|не\s)", a["batch_text"], re.I))
         lead = "Отлично! Предложенное время, к сожалению, уже прошло — давайте подберём новое." if a["time_passed"] \
-            else "Хорошо, подберём другое время." if a["declines_time"] else "Отлично!"
+            else "Хорошо, подберём другое время." if (a["declines_time"] or starts_no) else "Отлично!"
         if a["declines_time"] and not slots and not a["day"]:
             # предложенное время не подошло, других окон на сегодня нет — спрашиваем, когда удобно клиенту
             return [
@@ -486,12 +609,54 @@ def generate_variants(client_name: str, client_text: str, slots_text: str = "", 
         ]
 
     # 7. Начало разговора: ответ на вопрос → приглашение (текст Романа) → время
+    # класс ещё не знаем — уточняем сразу, как в методичке (пред-диагностика), чтобы подготовить пробный под уровень
+    class_q = "" if (a["grade"] or a["asked_grade"]) else "И подскажите, пожалуйста, в каком классе ученик?"
     return [
-        _say(o, *answers, INVITE_BLOCK + "\n" + _time_question(slots, a)),
+        _say(o, *answers, INVITE_BLOCK + "\n" + _time_question(slots, a), class_q),
         _say(o, *answers, _value_line(a), "Приглашаю на бесплатный пробный урок онлайн в Zoom (30 минут) — "
                                           "познакомимся и я выстрою стратегию подготовки.", _time_question(slots, a)),
         _say(o, *answers, _grade_question(a) or _value_line(a), INVITE_BLOCK + "\n" + _time_question(slots, a)),
     ]
+
+
+RECOGNIZED = ("asks_price", "asks_format", "wants_record", "agrees", "declines_time", "postpones", "declined",
+              "phone_q", "duration_q", "group_q", "homework_q", "pay_q", "messenger_q", "thinks", "offline_only",
+              "choose_between", "day", "time_passed", "confirmed", "gave_phone", "take_grade_q", "price_detail_q")
+INFO_RE = re.compile(r"\d{1,2}\s*-?\s*(?:й|ый|ой)?\s*кл|^\s*\d{1,2}\s*$|егэ|огэ|профил|баз\w*\s+уров|\d{2,3}\s*\+|балл|"
+                     r"^\s*(здравствуйте|добрый\s+(день|вечер)|доброе\s+утро|привет)\W*$", re.I)
+
+
+def auto_decision(a: dict, slots_text: str = "") -> tuple[bool, str]:
+    """Можно ли отправить ответ клиенту без Романа. Только там, где ситуация распознана уверенно;
+    всё остальное — карточкой Роману. Возвращает (можно, почему нельзя)."""
+    text = a["batch_text"]
+    if a.get("call_request"):
+        return False, "клиент через Avito просит перезвонить"
+    if not text.strip():
+        return False, "клиент ничего не написал"
+    if a.get("connecting"):
+        return False, "клиент на связи по уроку (подключается / ждёт / не может зайти) — ответьте сами"
+    if a["link_sent"] and not (a.get("ack_only") or (a["postpones"] and WILL_WRITE_RE.search(text))):
+        return False, "клиент уже записан (ссылку отправляли) — по записанным отвечаете вы"
+    if a["spam"]:
+        return False, "похоже на рекламу — отвечать не нужно"
+    if a.get("manual_only"):
+        return False, "нестандартная просьба (задача, вуз, жалоба) — нужен ваш ответ"
+    if a.get("batch_len", 0) > 400:
+        return False, "длинное сообщение — лучше ответить самому"
+    if a["confirmed"]:
+        d, hhmm = a["confirmed"]
+        free = [x.replace(".", ":").zfill(5) for x in TIME_RE.findall(slots_text or "")]
+        if (d or a["now"].date()) != a["now"].date() or hhmm not in free:
+            return False, f"клиент выбрал {hhmm}" + ("" if (d or a["now"].date()) == a["now"].date() else
+                                                    f" на {d:%d.%m}") + " — этого окна нет в ваших свободных, подтвердите сами"
+        return True, ""
+    known = any(a.get(k) for k in RECOGNIZED) or bool(INFO_RE.search(text))
+    if "?" in text and not known:
+        return False, "вопрос, на который нет готового ответа"
+    if not known and a["has_our_msgs"]:
+        return False, "не понял, что ответить"
+    return True, ""
 
 
 def generate_draft(client_name: str, client_text: str, slots_text: str = "") -> str:

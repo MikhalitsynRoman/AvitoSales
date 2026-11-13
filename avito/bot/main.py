@@ -12,8 +12,8 @@ from config import ADMIN_ID  # noqa: E402  (грузит avito/bot/.env до и�
 import client as avito_client  # noqa: E402
 import sheets  # noqa: E402
 import telegram_api as tg  # noqa: E402
-from script_engine import (TIME_RE, ZOOM_MARK, analyze_dialog, booking_key, category_text, is_past,  # noqa: E402
-                           expand_slots, generate_variants)
+from script_engine import (TIME_RE, ZOOM_MARK, analyze_dialog, auto_decision, booking_key,  # noqa: E402
+                           category_text, expand_slots, generate_variants, is_past)
 
 MSK = timezone(timedelta(hours=3))
 MAX_CHATS_TO_SCAN = 40
@@ -32,6 +32,7 @@ HELP_TEXT = (
     "я спрошу кнопками, кому его отправить.\n\n"
     "Команды:\n"
     "/status — работает ли бот, заявки и записи за сегодня, свободные окна\n"
+    "/auto on | /auto off — отвечать клиентам самому (в понятных ситуациях) или только через вас\n"
     "/price около 1000 ₽ за час — что отвечать на вопрос о цене (/price без текста — не называть цену)\n"
     "/zoom https://… — ссылка Zoom для подтверждения записи\n"
     "/booked Имя | Телефон | Когда | Класс | chat_id — записать на пробный"
@@ -324,8 +325,25 @@ def handle_callback(user_id: int, cq: dict) -> None:
         return
     v = contact["values"]
 
-    if action in ("send", "sv", "edit", "to") and _is_sent(v):
+    if action in ("send", "sv", "edit", "to", "now") and _is_sent(v):
         tg.answer_callback_query(cq["id"], "Этому клиенту уже отправлено ✅")
+        return
+
+    # любое ваше действие с карточкой отменяет автоответ: дальше решаете вы
+    if action in ("send", "sv", "edit", "own", "to", "noauto"):
+        cancelled = _cancel_auto(row_id)
+        if action == "noauto":
+            tg.answer_callback_query(cq["id"], "Не отправляю — ответьте сами" if cancelled else "Автоответа уже нет")
+            tg.edit_message_reply_markup(ADMIN_ID, message_id, _card_buttons(row_id))
+            return
+
+    if action == "now":
+        item = _pending_auto.get(row_id)
+        if not item:
+            tg.answer_callback_query(cq["id"], "Автоответа уже нет")
+            return
+        tg.answer_callback_query(cq["id"], "Отправляю клиенту…")
+        _send_auto(user_id, row_id, item)
         return
 
     if action == "to":
@@ -408,6 +426,9 @@ def status_text() -> str:
     healthy = ago is not None and ago < 5 * 60 and _stats["avito_fails"] == 0
     lines.append(("🟢 Бот работает" if healthy else "🟠 Бот запущен, но есть проблемы") + f" · {_stats['host']}")
     lines.append(f"Запущен: {_stats['started'][11:16]}")
+    day_auto = len([t for t, _ in _auto_sent_log if time.time() - t < 86400])
+    lines.append(f"🤖 Автоответ: {'включён' if _auto_enabled() else 'выключен'} · отправил сам после запуска: {day_auto}"
+                 f" · ждут отправки: {len(_pending_auto)}")
     if ago is None:
         lines.append("Avito ещё не проверялся после запуска")
     else:
@@ -469,6 +490,21 @@ def handle_message(user_id: int, msg: dict) -> None:
 
     if text.startswith("/status"):
         tg.send_message(ADMIN_ID, status_text())
+        return
+
+    if text.startswith("/auto"):
+        arg = text[len("/auto"):].strip().lower()
+        if arg in ("on", "off", "вкл", "выкл"):
+            mode = "on" if arg in ("on", "вкл") else "off"
+            sheets.set_state("auto_mode", mode)
+            if mode == "off":
+                for rid in list(_pending_auto):
+                    _cancel_auto(rid)
+        state = "включён" if _auto_enabled() else "выключен"
+        tg.send_message(ADMIN_ID, f"🤖 Автоответ {state}.\n"
+                                  f"Когда включён: в понятных ситуациях отвечаю клиенту сам через {AUTO_DELAY // 60} мин "
+                                  "после карточки (успеете нажать «Не отправлять»); остальное — вам.\n"
+                                  "/auto on — включить, /auto off — выключить.")
         return
 
     if text.startswith("/zoom"):
@@ -667,8 +703,118 @@ def _mark_answered_in_avito(chat_id: str) -> None:
                 [("✍️ Вы уже ответили в Avito", "noop")]))
 
 
+# ---------- автоответ ----------
+# Роман просил отвечать клиентам без него. Бот отвечает сам только там, где ситуация распознана уверенно
+# (script_engine.auto_decision), через AUTO_DELAY после карточки — чтобы Роман успел нажать «Не отправлять»,
+# и в жёстких лимитах: сбой не должен превратиться в рассылку клиентам (08.11 сбой таблицы дал 1500 карточек).
+
+AUTO_DELAY = 120
+AUTO_MAX_PER_CHAT_DAY = 5
+AUTO_MAX_PER_HOUR = 20
+_pending_auto = {}   # row_id -> {"due", "chat_id", "msg_id", "text", "card"}
+_auto_sent_log = []  # (время, chat_id) отправленных автоответов — для лимитов
+
+
+def _auto_enabled() -> bool:
+    return sheets.get_state("auto_mode", "on") == "on"
+
+
+def _auto_limits_ok(chat_id: str, a: dict, existing: dict | None) -> tuple[bool, str]:
+    now = time.time()
+    day = [t for t, c in _auto_sent_log if c == chat_id and now - t < 86400]
+    hour = [t for t, _ in _auto_sent_log if now - t < 3600]
+    if len(day) >= AUTO_MAX_PER_CHAT_DAY:
+        return False, f"этому клиенту бот уже ответил сам {len(day)} раз за сутки — дальше лучше вы"
+    if len(hour) >= AUTO_MAX_PER_HOUR:
+        return False, "слишком много автоответов за час — бот приостановил их, проверьте, всё ли в порядке"
+    # Роман сейчас сам ведёт этот диалог (его сообщение в Avito за последние 20 минут, а не наш автоответ)
+    last_out, last_ts = a.get("our_last_text", ""), a.get("our_last_ts", 0)
+    bot_text = (existing or {}).get("values", {}).get("Черновик ответа", "")
+    if last_out and now - last_ts < 20 * 60 and last_out.strip() != bot_text.strip():
+        return False, "вы сейчас сами ведёте этот диалог"
+    return True, ""
+
+
+def _auto_buttons(row_id: str) -> dict:
+    return tg.keyboard_rows([
+        [("✅ Отправить сейчас", f"now:{row_id}"), ("🚫 Не отправлять", f"noauto:{row_id}")],
+        [("❌ Исправить", f"edit:{row_id}")],
+    ])
+
+
+def _schedule_auto(row_id: str, chat_id: str, msg_id: str, text: str, card_id: int | None) -> None:
+    item = {"due": time.time() + AUTO_DELAY, "chat_id": chat_id, "msg_id": msg_id, "text": text, "card": card_id}
+    _pending_auto[row_id] = item
+    sheets.set_state(f"auto_{row_id}", json.dumps(item, ensure_ascii=False))  # переживёт перезапуск
+
+
+def _cancel_auto(row_id: str) -> bool:
+    if row_id not in _pending_auto:
+        return False
+    _pending_auto.pop(row_id, None)
+    sheets.set_state(f"auto_{row_id}", "")
+    return True
+
+
+def _load_pending_auto() -> None:
+    try:
+        _auto_sent_log[:] = [tuple(x) for x in json.loads(sheets.get_state("auto_log", "") or "[]")]
+    except ValueError:
+        pass
+    for key, (_, value) in list(sheets._load_state().items()):
+        if key.startswith("auto_") and key not in ("auto_mode", "auto_log") and value:
+            try:
+                _pending_auto[key[5:]] = json.loads(value)
+            except ValueError:
+                pass
+
+
+def _send_auto(user_id: int, row_id: str, item: dict) -> None:
+    """Перед отправкой ещё раз смотрим в чат: если клиент дописал или Роман ответил сам — не отправляем."""
+    _cancel_auto(row_id)
+    contact = sheets.get_contact_by_id(row_id)
+    if not contact or _is_sent(contact["values"]):
+        return
+    v = contact["values"]
+    raw = avito_client.get_messages(user_id, item["chat_id"], limit=3).get("messages", [])
+    if raw and raw[0].get("id") != item["msg_id"]:
+        who = "клиент дописал — пришлю новую карточку" if raw[0].get("direction") == "in" else "вы уже ответили сами"
+        if item.get("card"):
+            tg.edit_message_reply_markup(ADMIN_ID, int(item["card"]), tg.inline_keyboard(
+                [(f"⏸ Автоответ не отправлен: {who}", "noop")]))
+        return
+    if _stale_reason(item["text"], {**v, "Дата": today_str()}, row_id):
+        tg.send_message(ADMIN_ID, f"⏸ Не отправил автоответ {v['Имя']}: время в нём устарело. Нажмите «❌ Исправить».")
+        return
+    ok, why = _auto_limits_ok(item["chat_id"], {}, None)
+    if not ok:
+        tg.send_message(ADMIN_ID, f"⏸ Не отправил автоответ {v['Имя']}: {why}.")
+        return
+    if _send_to_client(user_id, row_id, item["text"], "отправлено (бот сам)"):
+        _auto_sent_log.append((time.time(), item["chat_id"]))
+        _auto_sent_log[:] = [x for x in _auto_sent_log if time.time() - x[0] < 86400]
+        sheets.set_state("auto_log", json.dumps(_auto_sent_log))
+        print(f"AUTO_SENT: {v['Имя']}")
+
+
+def process_due_autos(user_id: int) -> None:
+    for row_id, item in list(_pending_auto.items()):
+        if time.time() - item.get("due", 0) > 30 * 60:
+            # назначен давно (бот был выключен) — такой ответ уже не к месту, решает Роман
+            _cancel_auto(row_id)
+            if item.get("card"):
+                tg.edit_message_reply_markup(ADMIN_ID, int(item["card"]), _card_buttons(row_id))
+            continue
+        if time.time() >= item.get("due", 0):
+            try:
+                _send_auto(user_id, row_id, item)
+            except Exception as e:
+                _note_error("автоответ", e)
+
+
 def _notify_client(user_id: int, chat_id: str, name: str, city: str, avito_msg_id: str, last_text: str,
-                   slots_text: str, title: str = "Новое сообщение на Avito", when: tuple | None = None) -> None:
+                   slots_text: str, title: str = "Новое сообщение на Avito", when: tuple | None = None,
+                   allow_auto: bool = True) -> None:
     # смотрим всю переписку, а не одно последнее сообщение: класс, цель, о чём уже договорились
     dialog = _load_dialog(user_id, chat_id) or [{"direction": "in", "text": last_text, "created": time.time()}]
     a = analyze_dialog(dialog)
@@ -682,7 +828,20 @@ def _notify_client(user_id: int, chat_id: str, name: str, city: str, avito_msg_i
     row_id = existing["values"]["id"] if existing and existing["values"]["id"] else sheets.new_row_id()
     card = {"Имя": name, "Город": city, "Категория": category, "Сообщение клиента": client_text,
             "Черновик ответа": draft}
-    sent = tg.send_message(ADMIN_ID, _card_text(card, dialog, a.get("phone"), title), reply_markup=_card_buttons(row_id))
+
+    # отвечать ли самому: только в распознанных ситуациях, при включённом автоответе и в пределах лимитов
+    auto_ok, why = (False, "")
+    if allow_auto and _auto_enabled():
+        auto_ok, why = auto_decision(a, ", ".join(free_slots_today()))
+        if auto_ok:
+            auto_ok, why = _auto_limits_ok(chat_id, a, existing)
+    card_text = _card_text(card, dialog, a.get("phone"), "🤖 " + title + f" — отвечу сам через {AUTO_DELAY // 60} мин"
+                           if auto_ok else title)
+    if allow_auto and _auto_enabled() and not auto_ok and why:
+        card_text += f"\n\n✋ Нужен ваш ответ: {why}"
+    sent = tg.send_message(ADMIN_ID, card_text, reply_markup=_auto_buttons(row_id) if auto_ok else _card_buttons(row_id))
+    if auto_ok:
+        _schedule_auto(row_id, chat_id, avito_msg_id, draft, sent.get("message_id"))
     print(f"NEW_MESSAGE: {name} ({city}) -> notified")
     date, hhmm = when or (today_str(), _hhmm())
     if existing and existing["values"]["id"]:
@@ -749,7 +908,7 @@ def refresh_pending_once(user_id: int) -> None:
     for c in pending:
         _notify_client(user_id, c["chat_id"], c["Имя"], c["Город"], c["avito_msg_id"], c["Сообщение клиента"],
                        today_slots(), title="Заявка ждёт ответа (обновлено по всей переписке)",
-                       when=(c["Дата"], c["Время"]))
+                       when=(c["Дата"], c["Время"]), allow_auto=False)
 
 
 def _run_avito_check(user_id: int) -> None:
@@ -829,6 +988,7 @@ def main() -> None:
     sheets.get_logged_msg_ids()  # прогреваем кэш таблицы до первых нажатий
     # уже отправленные карточки (есть в таблице) второй раз не шлём и после перезапуска
     _notified_msgs.update(sheets.get_logged_msg_ids())
+    _load_pending_auto()  # автоответы, назначенные до перезапуска
     if RUN_SECONDS and len(sheets._load_state()) > 1500:
         try:
             cleaned = sheets.compact_state({c["id"] for c in sheets.all_contacts() if c["id"]})
@@ -861,6 +1021,7 @@ def main() -> None:
         try:
             poll_timeout = int(max(0, min(25, remaining, until_check))) if RUN_SECONDS else 0
             offset = process_telegram_updates(user_id, offset, poll_timeout)
+            process_due_autos(user_id)
         except Exception as e:
             print("ERROR telegram poll:", tg.clean_error(traceback.format_exc()))
             _note_error("Telegram", e)
