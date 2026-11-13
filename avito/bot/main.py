@@ -33,6 +33,7 @@ HELP_TEXT = (
     "Команды:\n"
     "/status — работает ли бот, заявки и записи за сегодня, свободные окна\n"
     "/auto on | /auto off — отвечать клиентам самому (в понятных ситуациях) или только через вас\n"
+    "/week — расписание на неделю (показать или задать: /week ср 14:00-16:00 пт 16-22 сб 11-22)\n"
     "/price около 1000 ₽ за час — что отвечать на вопрос о цене (/price без текста — не называть цену)\n"
     "/zoom https://… — ссылка Zoom для подтверждения записи\n"
     "/booked Имя | Телефон | Когда | Класс | chat_id — записать на пробный"
@@ -75,22 +76,82 @@ def booked_set() -> set:
     return {b.get("Когда пробный урок", "").strip() for b in sheets.get_bookings()}
 
 
-def free_slots_today() -> list[str]:
-    """Окна по 30 минут из часов, которые Роман дал на сегодня, без занятых и уже прошедших (+15 мин на ответ)."""
+WEEKDAY_SHORT = ["пн", "вт", "ср", "чт", "пт", "сб", "вс"]
+SCHEDULE_DAYS = 7
+
+
+def week_slots() -> dict:
+    """Обычное расписание Романа по дням недели: {0..6: "14:00-16:00, 18:30-22:00"} (0 — понедельник)."""
+    try:
+        return {int(k): v for k, v in json.loads(sheets.get_state("week_slots", "") or "{}").items()}
+    except ValueError:
+        return {}
+
+
+def day_slots_text(d) -> str:
+    """Часы на день: на сегодня — то, что Роман прислал утром (если прислал), иначе — недельное расписание."""
+    if d == datetime.now(MSK).date() and today_slots():
+        return today_slots()
+    return week_slots().get(d.weekday(), "")
+
+
+def schedule() -> dict | None:
+    """Свободные окна по 30 минут на ближайшие дни {дата: [...]}: без занятых и прошедших (+15 мин на ответ).
+    None — расписания нет совсем (ни недельного, ни на сегодня): тогда бот спрашивает клиента, когда удобно."""
+    if not week_slots() and not today_slots():
+        return None
     now = datetime.now(MSK)
     booked = booked_set()
-    result = []
-    for s in expand_slots(today_slots()):
-        h, m = map(int, s.split(":"))
-        if h * 60 + m < now.hour * 60 + now.minute + 15 or f"{today_str()} {s}" in booked:
-            continue
-        result.append(s)
+    result = {}
+    for i in range(SCHEDULE_DAYS):
+        d = (now + timedelta(days=i)).date()
+        result[d] = [s for s in expand_slots(day_slots_text(d))
+                     if not is_past(d, s, now) and booking_key(d, s) not in booked]
     return result
+
+
+def free_slots_today() -> list[str]:
+    return (schedule() or {}).get(datetime.now(MSK).date(), [])
 
 
 def _build_variants(name: str, client_text: str, a: dict) -> list[str]:
     return generate_variants(name, client_text, ", ".join(free_slots_today()), a, booked_set(),
-                             sheets.get_state("price_hint", ""), sheets.get_state("zoom_link", ""))
+                             sheets.get_state("price_hint", ""), sheets.get_state("zoom_link", ""),
+                             schedule=schedule())
+
+
+def parse_week(text: str) -> dict:
+    """«ср 14:00-16:00, 18:30-22:00 / вт 21:30 / чт 14-16, 19, 19:30 / сб 11-22» → {2: "...", 1: "...", ...}.
+    Одиночное время — одно окно на 30 минут; «14-16» понимаем как 14:00-16:00."""
+    names = {"пн": 0, "пон": 0, "вт": 1, "втор": 1, "ср": 2, "сред": 2, "чт": 3, "чет": 3, "пт": 4, "пят": 4,
+             "сб": 5, "суб": 5, "вс": 6, "вос": 6}
+    pattern = r"(?<![а-яё])(пн|понедельн\w*|вт|вторн\w*|ср|сред\w*|чт|четв\w*|пт|пятн\w*|сб|суббот\w*|вс|воскрес\w*)(?![а-яё])"
+    parts = re.split(pattern, text.lower())
+    result = {}
+    for i in range(1, len(parts) - 1, 2):
+        key = next((v for k, v in names.items() if parts[i].startswith(k)), None)
+        body = parts[i + 1]
+        if key is None:
+            continue
+        body = re.sub(r"(?<![:.\d])(\d{1,2})\s+(00|30)(?![:.\d])", r"\1:\2", body)  # «19 30» → 19:30
+        body = re.sub(r"(?<![:.\d])(\d{1,2})(?![:.\d])", r"\1:00", body)  # «с 14 до 16» → 14:00 … 16:00
+        body = re.sub(r"(\d{1,2}[:.]\d{2})\s*(?:-|–|—|до)\s*(\d{1,2}[:.]\d{2})", r"\1-\2", body.replace("с ", " "))
+        windows = []
+        for m in re.finditer(r"(\d{1,2}[:.]\d{2})(?:-(\d{1,2}[:.]\d{2}))?", body):
+            start = m.group(1).replace(".", ":").zfill(5)
+            if m.group(2):
+                windows.append(f"{start}-{m.group(2).replace('.', ':').zfill(5)}")
+            else:
+                h, mm = map(int, start.split(":"))
+                end = h * 60 + mm + 30
+                windows.append(f"{start}-{end // 60:02d}:{end % 60:02d}")
+        if windows:
+            result[key] = ", ".join(windows)
+    return result
+
+
+def week_text(week: dict) -> str:
+    return "\n".join(f"{WEEKDAY_SHORT[d]}: {week[d]}" for d in sorted(week)) or "не задано"
 
 
 def _save_meta(row_id: str, a: dict) -> None:
@@ -433,15 +494,25 @@ def status_text() -> str:
         lines.append("Avito ещё не проверялся после запуска")
     else:
         lines.append(f"Avito проверен {ago} с назад (проверка заняла {_stats['check_secs']:.1f} с)")
-    slots = today_slots()
-    if slots:
-        free = free_slots_today()
-        lines.append(f"Свободные окна сегодня (по 30 мин): {', '.join(free) if free else 'все заняты или прошли'}")
+    sched = schedule()
+    if sched is None:
+        lines.append("Расписание не задано — пришлите часы на сегодня или неделю командой /week")
     else:
-        lines.append("Свободное время на сегодня не указано — пришлите часы, например 15:00, 18:00 или 15:00-18:00")
-    upcoming = sorted(b for b in booked_set() if b[:10] == today_str() or b[:10] > today_str())
+        now_d = datetime.now(MSK).date()
+        lines.append("Свободные окна (по 30 мин):")
+        for d in sorted(sched)[:4]:
+            times = sched[d]
+            lbl = "сегодня" if d == now_d else WEEKDAY_SHORT[d.weekday()] + d.strftime(" %d.%m")
+            lines.append(f"  {lbl}: {', '.join(times[:8]) + (' …' if len(times) > 8 else '') if times else '—'}")
+
+    def _when_dt(b):
+        try:
+            return datetime.strptime(b, "%d.%m.%Y %H:%M").replace(tzinfo=MSK)
+        except ValueError:
+            return None
+    upcoming = sorted((w, b) for b in booked_set() if (w := _when_dt(b)) and w > datetime.now(MSK) - timedelta(hours=1))
     if upcoming:
-        lines.append(f"Записаны на пробный: {', '.join(b[:5] + ' ' + b[11:] for b in upcoming[:8])}")
+        lines.append(f"Записаны на пробный: {', '.join(b[:5] + ' ' + b[11:] for _, b in upcoming[:8])}")
 
     today = today_str()
     todays = [c for c in sheets.all_contacts() if _same_day(c["Дата"], today) and c["Имя"] != "—"]
@@ -468,6 +539,17 @@ def status_text() -> str:
     return "\n".join(lines)
 
 
+def _save_week(week: dict) -> None:
+    sheets.set_state("week_slots", json.dumps({str(k): v for k, v in week.items()}, ensure_ascii=False))
+    nxt = []
+    for d, times in sorted((schedule() or {}).items()):
+        if times:
+            nxt.append(f"{WEEKDAY_SHORT[d.weekday()]} {d:%d.%m}: {times[0]}–{times[-1]} ({len(times)} окон)")
+    tg.send_message(ADMIN_ID, "Принял расписание на неделю:\n" + week_text(week) +
+                    "\n\nБлижайшие свободные окна:\n" + ("\n".join(nxt[:5]) or "—") +
+                    "\n\nПробный — 30 минут, в час записываю до двух человек. Дни, которых нет в списке, — выходные.")
+
+
 def _save_slots(text: str) -> None:
     sheets.set_state("slots_text", text)
     sheets.set_state("slots_date", today_str())
@@ -490,6 +572,19 @@ def handle_message(user_id: int, msg: dict) -> None:
 
     if text.startswith("/status"):
         tg.send_message(ADMIN_ID, status_text())
+        return
+
+    if text.startswith("/week"):
+        body = text[len("/week"):].strip()
+        if body:
+            week = parse_week(body)
+            if not week:
+                tg.send_message(ADMIN_ID, "Не разобрал дни. Пример: /week ср 14:00-16:00, 18:30-22:00 пт 16-22 сб 11-22")
+                return
+            _save_week(week)
+        else:
+            tg.send_message(ADMIN_ID, "Расписание на неделю:\n" + week_text(week_slots()) +
+                            "\n\nИзменить: /week ср 14:00-16:00, 18:30-22:00 пт 16-22 сб 11-22 (дни, которых нет, — выходные)")
         return
 
     if text.startswith("/auto"):
@@ -549,6 +644,11 @@ def handle_message(user_id: int, msg: dict) -> None:
 
     # Только часы («15:00, 18:30», «сегодня 13:00 и 15:00») — это свободное время. Любой другой текст скорее всего
     # ответ клиенту, написанный без reply, — спрашиваем кнопками, кому его отправить.
+    # «в среду с 14 до 16, в пятницу с 16 до 22…» — расписание на неделю (минимум два дня с часами)
+    week = parse_week(text)
+    if len(week) >= 2:
+        _save_week(week)
+        return
     leftover = re.sub(r"[^a-zа-яё]", "", TIME_RE.sub("", text.lower()))
     if TIME_RE.search(text) and len(leftover) <= 12:
         _save_slots(text)
@@ -627,12 +727,25 @@ def maybe_ask_daily_slots() -> None:
     if datetime.now(MSK).hour < 9:
         return
     _asked_today = today
-    prompt = tg.send_message(
-        ADMIN_ID,
-        "Доброе утро! Какое время сегодня свободно для пробных уроков?\n"
-        "Напишите свободные часы (15:00, 18:00) или промежуток (15:00-18:00) — "
-        "в каждый час запишу до 2 человек по 30 минут.",
-    )
+    week = week_slots()
+    if week:
+        # есть недельное расписание — не спрашиваем, а напоминаем, что предлагаем сегодня; в выходной молчим
+        todays = week.get(datetime.now(MSK).weekday())
+        if not todays:
+            sheets.set_state("slots_prompt_date", today)
+            return
+        prompt = tg.send_message(
+            ADMIN_ID,
+            f"Доброе утро! Сегодня по расписанию записываю на пробные: {todays}.\n"
+            "Если что-то изменилось — пришлите новое время на сегодня (например 15:00-18:00).",
+        )
+    else:
+        prompt = tg.send_message(
+            ADMIN_ID,
+            "Доброе утро! Какое время сегодня свободно для пробных уроков?\n"
+            "Напишите свободные часы (15:00, 18:00) или промежуток (15:00-18:00) — "
+            "в каждый час запишу до 2 человек по 30 минут.",
+        )
     sheets.set_state("slots_prompt_date", today)
     sheets.set_state("slots_prompt_msg_id", str(prompt.get("message_id", "")))
 
@@ -832,7 +945,7 @@ def _notify_client(user_id: int, chat_id: str, name: str, city: str, avito_msg_i
     # отвечать ли самому: только в распознанных ситуациях, при включённом автоответе и в пределах лимитов
     auto_ok, why = (False, "")
     if allow_auto and _auto_enabled():
-        auto_ok, why = auto_decision(a, ", ".join(free_slots_today()))
+        auto_ok, why = auto_decision(a, ", ".join(free_slots_today()), schedule())
         if auto_ok:
             auto_ok, why = _auto_limits_ok(chat_id, a, existing)
     card_text = _card_text(card, dialog, a.get("phone"), "🤖 " + title + f" — отвечу сам через {AUTO_DELAY // 60} мин"

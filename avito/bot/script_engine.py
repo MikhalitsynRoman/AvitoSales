@@ -261,6 +261,7 @@ def analyze_dialog(messages: list[dict], now: datetime | None = None) -> dict:
         "results_said": any("вполне реально" in m["text"].lower() for m in our_msgs),
         "compare_tried": any("сравните" in m["text"].lower() for m in our_msgs),
         "our_times": our_times,
+        "our_day": our_day,
         "our_last_text": our_last["text"] if our_last else "",
         "our_last_ts": our_last["created"] if our_last else 0,
         "batch_len": len(batch_text),
@@ -443,9 +444,45 @@ def _value_line(a: dict) -> str:
     return "На пробном посмотрим текущий уровень и составим понятный план подготовки."
 
 
+def _when(d: date, today: date) -> str:
+    """«сегодня» / «завтра» / «в среду, 18 ноября,» — для фразы «будет удобно подключиться … в 14:00»."""
+    label = day_label(d, today)
+    return label if d in (today, today + timedelta(days=1)) else label + ","
+
+
+def _day_slots(a: dict, d: date) -> list[str]:
+    times = list((a.get("_schedule") or {}).get(d, []))
+    if a.get("declines_time") and d == a.get("our_day"):  # от этого времени уже отказались
+        times = [t for t in times if t not in a.get("our_times", [])]
+    return times
+
+
+def _offer(times: list[str], d: date, today: date, lead: str) -> str:
+    w = _when(d, today)
+    if len(times) >= 2:
+        return f"{lead} {w} в {times[0]} или в {times[1]} мск?"
+    return f"{lead} {w} в {times[0]} мск?"
+
+
 def _time_question(slots: list[str], a: dict, polite: bool = True) -> str:
     today = a["now"].date()
     lead = "Скажите, пожалуйста, будет удобно подключиться" if polite else "Удобно подключиться"
+    sched = a.get("_schedule")
+    if sched is not None:
+        # есть расписание Романа на ближайшие дни — предлагаем конкретные свободные окна
+        days = sorted(d for d in sched if _day_slots(a, d))
+        if a["day"]:
+            want = _day_slots(a, a["day"])
+            if want:
+                return _offer(want, a["day"], today, lead)
+            later = [d for d in days if d > a["day"]] or days
+            if later:
+                lbl = day_label(a["day"], today)
+                return (f"{lbl[0].upper() + lbl[1:]}, к сожалению, свободных окон нет. "
+                        + _offer(_day_slots(a, later[0]), later[0], today, "Могу предложить").rstrip("?")
+                        + " — будет удобно?")
+        elif days:
+            return _offer(_day_slots(a, days[0]), days[0], today, lead)
     if a["day"] and a["day"] != today:
         return f"Во сколько вам будет удобно подключиться {day_label(a['day'], today)}? Пробный идёт 30 минут."
     if len(slots) >= 2:
@@ -463,15 +500,28 @@ def _grade_question(a: dict) -> str:
     return "Подскажите, в каком классе и к какому экзамену готовитесь — ЕГЭ или ОГЭ?"
 
 
+def _clean_schedule(schedule: dict | None, a: dict, booked: set) -> dict | None:
+    """Только будущие и незанятые окна — даже если передали список с прошедшими."""
+    if schedule is None:
+        return None
+    return {d: [t for t in times if not is_past(d, t, a["now"]) and booking_key(d, t) not in booked]
+            for d, times in schedule.items()}
+
+
 def generate_variants(client_name: str, client_text: str, slots_text: str = "", dialog: dict | None = None,
-                      booked: set | None = None, price_hint: str = "", zoom_link: str = "") -> list[str]:
-    """slots_text — свободные окна на сегодня (уже без занятых и прошедших), booked — занятые «дд.мм.гггг ЧЧ:ММ»."""
-    a = dialog or analyze_dialog([{"direction": "in", "text": client_text or "", "created": 0}])
+                      booked: set | None = None, price_hint: str = "", zoom_link: str = "",
+                      schedule: dict | None = None) -> list[str]:
+    """slots_text — свободные окна на сегодня (уже без занятых и прошедших), booked — занятые «дд.мм.гггг ЧЧ:ММ»,
+    schedule — свободные окна на ближайшие дни {дата: ["14:00", …]} (если задано, главнее slots_text)."""
+    a = dict(dialog or analyze_dialog([{"direction": "in", "text": client_text or "", "created": 0}]))
     booked = booked or set()
     today = a["now"].date()
+    a["_schedule"] = _clean_schedule(schedule, a, booked)
     # окна «сегодня» — только будущие, даже если кто-то передал список с прошедшими
     slots = [s for s in (x.replace(".", ":").zfill(5) for x in TIME_RE.findall(slots_text or ""))
              if not is_past(today, s, a["now"])]
+    if a["_schedule"] is not None:
+        slots = list(a["_schedule"].get(today, []))
     if a.get("declines_time"):  # от предложенного времени отказались — его больше не предлагаем
         slots = [s for s in slots if s not in a.get("our_times", [])]
     o = _greeting(client_name, a)
@@ -528,14 +578,25 @@ def generate_variants(client_name: str, client_text: str, slots_text: str = "", 
         d, hhmm = a["confirmed"]
         d = d or today
         when = f"{day_label(d, today)} в {hhmm} мск"
-        alt = [s for s in slots if s != hhmm][:2] if d == today else []
-        offer = f"Могу предложить {' или '.join(alt)} мск — как вам удобнее?" if alt else \
-            "Подскажите, какое ещё время вам удобно?"
-        if d == today and slots and hhmm not in slots and booking_key(d, hhmm) not in booked:
-            # клиент назвал время вне ваших свободных окон на сегодня — не подтверждаем, предлагаем свободные
+        sched = a["_schedule"]
+        day_free = (sched.get(d, []) if sched is not None else (slots if d == today else []))
+        alt = [s for s in day_free if s != hhmm][:2]
+        if alt:
+            offer = f"Могу предложить {_when(d, today)} в {' или в '.join(alt)} мск — как вам удобнее?"
+        elif sched is not None and any(sched.get(x) for x in sched if x != d):
+            nxt = min(x for x in sched if x != d and sched.get(x) and x >= today)
+            offer = _offer(sched[nxt], nxt, today, "Могу предложить").rstrip("?") + " — будет удобно?"
+        else:
+            offer = "Подскажите, какое ещё время вам удобно?"
+        known_day = sched is not None or d == today
+        if known_day and (day_free or sched is not None) and hhmm not in day_free \
+                and booking_key(d, hhmm) not in booked:
+            # клиент назвал время вне ваших свободных окон — не подтверждаем, предлагаем свободные
+            lbl = day_label(d, today)
             return [
-                _say(o, f"В {hhmm} сегодня, к сожалению, не получится. {offer}"),
-                _say(o, f"На {hhmm} сегодня уже нет мест. {offer}"),
+                _say(o, f"{_when(d, today)[0].upper() + _when(d, today)[1:]} в {hhmm}, к сожалению, не получится. "
+                        f"{offer}"),
+                _say(o, f"На {hhmm} {lbl} уже нет мест. {offer}"),
                 _say(o, f"{hhmm}, к сожалению, занято. {offer}"),
             ]
         if booking_key(d, hhmm) in booked:
@@ -584,7 +645,11 @@ def generate_variants(client_name: str, client_text: str, slots_text: str = "", 
         starts_no = bool(re.match(r"^\W*(нет|не\s)", a["batch_text"], re.I))
         lead = "Отлично! Предложенное время, к сожалению, уже прошло — давайте подберём новое." if a["time_passed"] \
             else "Хорошо, подберём другое время." if (a["declines_time"] or starts_no) else "Отлично!"
-        if a["declines_time"] and not slots and not a["day"]:
+        sched = a.get("_schedule")
+        if a["day"] and sched is not None and not _day_slots(a, a["day"]):
+            lead = ""  # в этот день окон нет — «Отлично!» перед «к сожалению» звучит странно
+        any_free = sched is not None and any(_day_slots(a, d) for d in sched)
+        if a["declines_time"] and not slots and not a["day"] and not any_free:
             # предложенное время не подошло, других окон на сегодня нет — спрашиваем, когда удобно клиенту
             return [
                 _say(o, *answers, "Хорошо, подберём другое время. Подскажите, в какой день и во сколько вам будет удобно? "
@@ -626,7 +691,7 @@ INFO_RE = re.compile(r"\d{1,2}\s*-?\s*(?:й|ый|ой)?\s*кл|^\s*\d{1,2}\s*$|�
                      r"^\s*(здравствуйте|добрый\s+(день|вечер)|доброе\s+утро|привет)\W*$", re.I)
 
 
-def auto_decision(a: dict, slots_text: str = "") -> tuple[bool, str]:
+def auto_decision(a: dict, slots_text: str = "", schedule: dict | None = None) -> tuple[bool, str]:
     """Можно ли отправить ответ клиенту без Романа. Только там, где ситуация распознана уверенно;
     всё остальное — карточкой Роману. Возвращает (можно, почему нельзя)."""
     text = a["batch_text"]
@@ -644,6 +709,12 @@ def auto_decision(a: dict, slots_text: str = "") -> tuple[bool, str]:
         return False, "нестандартная просьба (задача, вуз, жалоба) — нужен ваш ответ"
     if a.get("batch_len", 0) > 400:
         return False, "длинное сообщение — лучше ответить самому"
+    if a["confirmed"] and schedule is not None:
+        d = a["confirmed"][0] or a["now"].date()
+        if d not in schedule:
+            return False, f"клиент выбрал {d:%d.%m} — это дальше, чем расписание на неделю, подтвердите сами"
+        # окно свободно — бот запишет; занято или вне расписания — бот сам предложит свободные (ничего не бронирует)
+        return True, ""
     if a["confirmed"]:
         d, hhmm = a["confirmed"]
         free = [x.replace(".", ":").zfill(5) for x in TIME_RE.findall(slots_text or "")]
