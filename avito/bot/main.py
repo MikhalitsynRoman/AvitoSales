@@ -12,8 +12,9 @@ from config import ADMIN_ID  # noqa: E402  (грузит avito/bot/.env до и�
 import client as avito_client  # noqa: E402
 import sheets  # noqa: E402
 import telegram_api as tg  # noqa: E402
+import ai_reply  # noqa: E402
 from script_engine import (TIME_RE, ZOOM_MARK, analyze_dialog, auto_decision, booking_key,  # noqa: E402
-                           category_text, expand_slots, generate_variants, is_past)
+                           category_text, confirm_block, day_label, expand_slots, generate_variants, is_past)
 
 MSK = timezone(timedelta(hours=3))
 MAX_CHATS_TO_SCAN = 40
@@ -33,6 +34,7 @@ HELP_TEXT = (
     "Команды:\n"
     "/status — работает ли бот, заявки и записи за сегодня, свободные окна\n"
     "/auto on | /auto off — отвечать клиентам самому (в понятных ситуациях) или только через вас\n"
+    "/ai on | /ai off — отвечать по смыслу через YandexGPT или только по правилам\n"
     "/week — расписание на неделю (показать или задать: /week ср 14:00-16:00 пт 16-22 сб 11-22)\n"
     "/price около 1000 ₽ за час — что отвечать на вопрос о цене (/price без текста — не называть цену)\n"
     "/zoom https://… — ссылка Zoom для подтверждения записи\n"
@@ -440,6 +442,14 @@ def handle_callback(user_id: int, cq: dict) -> None:
         if dialog:
             a = analyze_dialog(dialog)
             variants = _build_variants(v["Имя"], a["batch_text"] or v["Сообщение клиента"], a)
+            if _ai_enabled() and not _hard_manual_reason(a):
+                ai = ai_reply.ai_reply(v["Имя"], dialog, a, schedule(), sheets.get_state("price_hint", ""), variants[0])
+                if ai and ai["action"] == "reply":
+                    variants = [ai["text"]] + [x for x in variants if x != ai["text"]][:2]
+                elif ai and ai["action"] == "book":
+                    a = {**a, "confirmed": (ai["date_obj"], ai["time"])}
+                    variants = [confirm_block(sheets.get_state("zoom_link", "")) + f"\n\nЖду вас "
+                                f"{day_label(ai['date_obj'], datetime.now(MSK).date())} в {ai['time']} мск!"] + variants[:2]
             sheets.set_state(f"var_{row_id}", json.dumps(variants, ensure_ascii=False))
             sheets.set_state(f"vardate_{row_id}", today_str())
             _save_meta(row_id, a)
@@ -490,6 +500,12 @@ def status_text() -> str:
     day_auto = len([t for t, _ in _auto_sent_log if time.time() - t < 86400])
     lines.append(f"🤖 Автоответ: {'включён' if _auto_enabled() else 'выключен'} · отправил сам после запуска: {day_auto}"
                  f" · ждут отправки: {len(_pending_auto)}")
+    u = ai_reply.usage()
+    if not ai_reply.available():
+        lines.append("🧠 YandexGPT: не подключён (нет ключа YC_API_KEY / YC_FOLDER_ID) — отвечаю по правилам")
+    else:
+        lines.append(f"🧠 YandexGPT: {'включён' if _ai_enabled() else 'выключен (/ai on)'} · сегодня запросов {u['calls']}, "
+                     f"не удалось {u['fails']}, токенов {u['tokens_in']}+{u['tokens_out']}")
     if ago is None:
         lines.append("Avito ещё не проверялся после запуска")
     else:
@@ -585,6 +601,19 @@ def handle_message(user_id: int, msg: dict) -> None:
         else:
             tg.send_message(ADMIN_ID, "Расписание на неделю:\n" + week_text(week_slots()) +
                             "\n\nИзменить: /week ср 14:00-16:00, 18:30-22:00 пт 16-22 сб 11-22 (дни, которых нет, — выходные)")
+        return
+
+    if text.startswith("/ai"):
+        arg = text[len("/ai"):].strip().lower()
+        if arg in ("on", "off"):
+            sheets.set_state("ai_mode", arg)
+        if not ai_reply.available():
+            tg.send_message(ADMIN_ID, "🧠 YandexGPT не подключён: на хостинге нет ключа (YC_API_KEY и YC_FOLDER_ID в "
+                                      "credentials/.env). Пока отвечаю по правилам.")
+        else:
+            tg.send_message(ADMIN_ID, f"🧠 YandexGPT {'включён' if _ai_enabled() else 'выключен'}. Когда включён — "
+                                      "отвечаю по смыслу переписки, а если модель не справилась — по правилам.\n"
+                                      "/ai on — включить, /ai off — только правила.")
         return
 
     if text.startswith("/auto"):
@@ -925,6 +954,25 @@ def process_due_autos(user_id: int) -> None:
                 _note_error("автоответ", e)
 
 
+def _ai_enabled() -> bool:
+    return sheets.get_state("ai_mode", "on") == "on" and ai_reply.available()
+
+
+def _hard_manual_reason(a: dict) -> str:
+    """Где отвечает только Роман — и модель, и правила: урок идёт, реклама, задачи/жалобы, звонок, после записи."""
+    if a.get("call_request"):
+        return "клиент просит перезвонить"
+    if a.get("connecting"):
+        return "клиент на связи по уроку"
+    if a.get("spam"):
+        return "реклама"
+    if a.get("manual_only"):
+        return "нестандартная просьба (задача, вуз, жалоба)"
+    if a.get("link_sent") and not a.get("ack_only"):
+        return "клиент уже записан"
+    return ""
+
+
 def _notify_client(user_id: int, chat_id: str, name: str, city: str, avito_msg_id: str, last_text: str,
                    slots_text: str, title: str = "Новое сообщение на Avito", when: tuple | None = None,
                    allow_auto: bool = True) -> None:
@@ -939,17 +987,38 @@ def _notify_client(user_id: int, chat_id: str, name: str, city: str, avito_msg_i
     # один клиент — одна строка: если он уже писал, обновляем его строку, а старую карточку гасим
     existing = sheets.find_contact_by_chat(chat_id)
     row_id = existing["values"]["id"] if existing and existing["values"]["id"] else sheets.new_row_id()
+    # 🧠 YandexGPT отвечает по смыслу всей переписки; правила — страховка и запасной вариант, если модель
+    # недоступна или её ответ не прошёл проверку (ai_reply.validate)
+    ai, ai_tag, hard = None, "", _hard_manual_reason(a)
+    if allow_auto and _ai_enabled() and not hard:
+        ai = ai_reply.ai_reply(name, dialog, a, schedule(), sheets.get_state("price_hint", ""), variants[0])
+    if ai and ai["action"] in ("reply", "book"):
+        if ai["action"] == "book":
+            d, t = ai["date_obj"], ai["time"]
+            draft = (confirm_block(sheets.get_state("zoom_link", ""))
+                     + f"\n\nЖду вас {day_label(d, datetime.now(MSK).date())} в {t} мск!")
+            a = {**a, "confirmed": (d, t)}  # чтобы _save_meta запомнил окно и после отправки бот записал в таблицу
+        else:
+            draft = ai["text"]
+        variants = [draft] + [v for v in variants if v != draft][:2]
+        ai_tag = "🧠 "
     card = {"Имя": name, "Город": city, "Категория": category, "Сообщение клиента": client_text,
             "Черновик ответа": draft}
 
     # отвечать ли самому: только в распознанных ситуациях, при включённом автоответе и в пределах лимитов
     auto_ok, why = (False, "")
     if allow_auto and _auto_enabled():
-        auto_ok, why = auto_decision(a, ", ".join(free_slots_today()), schedule())
+        if ai and ai["action"] == "manual":
+            auto_ok, why = False, "YandexGPT считает, что лучше ответить вам: " + (ai.get("reason") or "нестандартный вопрос")
+        elif ai:
+            auto_ok, why = True, ""
+        else:
+            auto_ok, why = auto_decision(a, ", ".join(free_slots_today()), schedule())
         if auto_ok:
             auto_ok, why = _auto_limits_ok(chat_id, a, existing)
     auto_title = (f" — отвечу сам через {AUTO_DELAY // 60} мин" if AUTO_DELAY else " — отвечаю сам")
-    card_text = _card_text(card, dialog, a.get("phone"), "🤖 " + title + auto_title if auto_ok else title)
+    card_text = _card_text(card, dialog, a.get("phone"), ai_tag + "🤖 " + title + auto_title if auto_ok
+                           else ai_tag + title)
     if allow_auto and _auto_enabled() and not auto_ok and why:
         card_text += f"\n\n✋ Нужен ваш ответ: {why}"
     # без задержки отменять нечего — кнопки обычные (останутся, только если отправка вдруг не удалась)
@@ -1107,6 +1176,12 @@ def main() -> None:
     # уже отправленные карточки (есть в таблице) второй раз не шлём и после перезапуска
     _notified_msgs.update(sheets.get_logged_msg_ids())
     _load_pending_auto()  # автоответы, назначенные до перезапуска
+    try:  # видно в «Состоянии»: поставился ли SDK на хостинге и есть ли ключ (сам ключ не пишем)
+        import yandex_ai_studio_sdk
+        sdk_state = f"SDK {getattr(yandex_ai_studio_sdk, '__version__', 'есть')}"
+    except Exception as e:
+        sdk_state = f"SDK не установлен ({type(e).__name__})"
+    sheets.set_state("ai_diag", f"{_now()}: {sdk_state}; ключ {'есть' if ai_reply.available() else 'нет'}")
     if RUN_SECONDS and len(sheets._load_state()) > 1500:
         try:
             cleaned = sheets.compact_state({c["id"] for c in sheets.all_contacts() if c["id"]})
