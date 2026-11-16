@@ -188,6 +188,21 @@ def validate(result: dict, schedule: dict | None) -> tuple[bool, str]:
     return True, ""
 
 
+def ping() -> str:
+    """Короткий тестовый запрос без данных клиентов — проверить ключ и связь при запуске бота."""
+    t0 = time.time()
+    try:
+        res = _model().run([
+            {"role": "system", "text": 'Ответь строго JSON: {"ok": true}'},
+            {"role": "user", "text": "проверка связи"},
+        ])
+        ok = "true" in res.text.lower()
+        return (f"{'работает' if ok else 'ответ странный'}, {time.time() - t0:.1f} с, модель "
+                f"{getattr(res, 'model_version', '?')}: {res.text.strip()[:60]}")
+    except Exception as e:
+        return f"ошибка за {time.time() - t0:.1f} с: {type(e).__name__}: {str(e)[:200]}"
+
+
 def ai_reply(name: str, dialog: list[dict], a: dict, schedule: dict | None, price_hint: str,
              rule_draft: str) -> dict | None:
     """{"action": "reply"|"book"|"manual", "text"…} или None — тогда бот отвечает по правилам."""

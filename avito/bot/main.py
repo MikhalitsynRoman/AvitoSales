@@ -1181,7 +1181,9 @@ def main() -> None:
         sdk_state = f"SDK {getattr(yandex_ai_studio_sdk, '__version__', 'есть')}"
     except Exception as e:
         sdk_state = f"SDK не установлен ({type(e).__name__})"
-    sheets.set_state("ai_diag", f"{_now()}: {sdk_state}; ключ {'есть' if ai_reply.available() else 'нет'}")
+    test = ai_reply.ping() if ai_reply.available() else "не проверял"
+    sheets.set_state("ai_diag", f"{_now()}: {sdk_state}; ключ {'есть' if ai_reply.available() else 'нет'}; "
+                                f"тестовый запрос: {test}")
     if RUN_SECONDS and len(sheets._load_state()) > 1500:
         try:
             cleaned = sheets.compact_state({c["id"] for c in sheets.all_contacts() if c["id"]})
