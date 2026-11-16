@@ -60,7 +60,8 @@ def _append(sheet, values: list) -> int:
     return row_num
 
 
-def _get_or_create_sheet(spreadsheet, name: str, headers: list):
+def _get_or_create_sheet(spreadsheet, name: str, headers: list, any_order: bool = False):
+    """any_order — колонки можно переставлять руками (лист читается и пишется по названиям колонок)."""
     if name in _sheet_cache:
         return _sheet_cache[name]
     try:
@@ -73,7 +74,7 @@ def _get_or_create_sheet(spreadsheet, name: str, headers: list):
     first = sheet.row_values(1)
     if not first:
         sheet.update(values=[headers], range_name="A1", value_input_option=RAW)
-    elif first != headers:
+    elif first != headers and not (any_order and set(headers) <= set(first)):
         # Раньше здесь лист очищался целиком — так можно потерять все заявки. Теперь только останавливаемся.
         raise RuntimeError(f"В листе «{name}» изменена первая строка (заголовки) — данные не трогаю. "
                            f"Нужно: {', '.join(headers)}")
@@ -265,13 +266,16 @@ def update_contact_status(row_id: str, status: str, new_draft: str | None = None
 
 
 _bookings = None  # строки листа «Записаны на пробный» (в памяти, как и остальные листы)
+_bookings_head = list(BOOKINGS_HEADERS)  # порядок колонок в листе: 16.11 «Класс/цель» перенесли во 2-й столбец
 
 
 def get_bookings() -> list[dict]:
-    global _bookings
+    global _bookings, _bookings_head
     if _bookings is None:
-        sheet = _get_or_create_sheet(_spreadsheet(), BOOKINGS_SHEET, BOOKINGS_HEADERS)
-        _bookings = [dict(zip(BOOKINGS_HEADERS, r)) for r in sheet.get_all_values()[1:]]
+        sheet = _get_or_create_sheet(_spreadsheet(), BOOKINGS_SHEET, BOOKINGS_HEADERS, any_order=True)
+        values = sheet.get_all_values()
+        _bookings_head = values[0] if values and values[0] else list(BOOKINGS_HEADERS)
+        _bookings = [dict(zip(_bookings_head, r)) for r in values[1:]]
     return _bookings
 
 
@@ -279,8 +283,10 @@ def log_booking(name: str, phone: str, chat_id: str, when: str, goal: str) -> No
     """when — «05.11.2026 16:30»: по нему бот понимает, что это окно занято."""
     bookings = get_bookings()
     row = [datetime.now().strftime("%d.%m.%Y %H:%M"), name or "—", phone or "—", chat_id, when or "—", goal or "—"]
-    _append(_get_or_create_sheet(_spreadsheet(), BOOKINGS_SHEET, BOOKINGS_HEADERS), row)
-    bookings.append(dict(zip(BOOKINGS_HEADERS, row)))
+    data = dict(zip(BOOKINGS_HEADERS, row))
+    _append(_get_or_create_sheet(_spreadsheet(), BOOKINGS_SHEET, BOOKINGS_HEADERS, any_order=True),
+            [data.get(h, "") for h in _bookings_head])
+    bookings.append(data)
 
 # ---------- состояние (ключ -> значение) ----------
 

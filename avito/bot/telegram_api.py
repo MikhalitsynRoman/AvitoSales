@@ -1,3 +1,5 @@
+import json
+import os
 import socket
 import time
 
@@ -5,7 +7,7 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-from config import BOT_TOKEN
+from config import ADMIN_ID, BOT_TOKEN
 
 API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
@@ -72,11 +74,82 @@ def get_updates(offset: int | None = None, timeout: int = 2) -> list:
     return _call("getUpdates", payload, read_timeout=timeout + 10).get("result", [])
 
 
-def send_message(chat_id: int, text: str, reply_markup: dict | None = None) -> dict:
+def send_direct(chat_id: int, text: str, reply_markup: dict | None = None) -> dict:
+    """Сообщение только этому человеку, без копий команде."""
     payload = {"chat_id": chat_id, "text": text}
     if reply_markup:
         payload["reply_markup"] = reply_markup
     return _call("sendMessage", payload).get("result", {})
+
+
+def send_message(chat_id: int, text: str, reply_markup: dict | None = None) -> dict:
+    res = send_direct(chat_id, text, reply_markup)
+    if chat_id == ADMIN_ID and res.get("message_id"):
+        _copy_to_team(res["message_id"], text, reply_markup)
+    return res
+
+
+# ---------- Команда: всё, что бот пишет Роману, копией уходит людям, которым он открыл доступ (/join) ----------
+# У каждой копии свой номер сообщения в чате помощника. Связь «номер у Романа ↔ номер у помощника» хранится в файле
+# рядом с токеном Avito: по ней правки карточки (✅ Отправлено, варианты) доходят до всех копий, а нажатие кнопки
+# или reply в копии бот понимает как действие с карточкой Романа. Копии — не обязательны: если до помощника
+# не дошло (заблокировал бота, нет связи), у Романа всё работает как раньше.
+team_ids = lambda: []  # noqa: E731  main подставляет функцию, которая читает список из «Состояния»
+_MAP_FILE = os.path.expanduser("~/.avito_team_map.json")
+_MAP_KEEP = 5000
+
+
+def _load_map() -> dict:
+    try:
+        with open(_MAP_FILE, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+_copies = _load_map()  # "номер у Романа" -> {"chat_id помощника": номер копии}
+_origin = {(int(c), int(m)): int(a) for a, cs in _copies.items() for c, m in cs.items()}
+
+
+def _save_map() -> None:
+    if len(_copies) > _MAP_KEEP:
+        for key in sorted(_copies, key=int)[:len(_copies) - _MAP_KEEP]:
+            for c, m in _copies.pop(key).items():
+                _origin.pop((int(c), int(m)), None)
+    try:
+        tmp = _MAP_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(_copies, f)
+        os.replace(tmp, _MAP_FILE)
+    except OSError as e:
+        print("team map not saved:", e)
+
+
+def _copy_to_team(admin_msg_id: int, text: str, reply_markup: dict | None) -> None:
+    made = {}
+    for cid in team_ids():
+        payload = {"chat_id": cid, "text": text}
+        if reply_markup:
+            payload["reply_markup"] = reply_markup
+        mid = (_call("sendMessage", payload, raise_errors=False).get("result") or {}).get("message_id")
+        if mid:
+            made[str(cid)] = mid
+            _origin[(cid, mid)] = admin_msg_id
+    if made:
+        _copies[str(admin_msg_id)] = made
+        _save_map()
+
+
+def _edit_copies(method: str, admin_msg_id: int, payload: dict) -> None:
+    members = set(team_ids())  # тем, у кого доступ закрыли, новое больше не показываем
+    for cid, mid in (_copies.get(str(admin_msg_id)) or {}).items():
+        if int(cid) in members:
+            _call(method, {**payload, "chat_id": int(cid), "message_id": mid}, raise_errors=False)
+
+
+def to_admin_message(chat_id: int, message_id: int) -> int | None:
+    """Номер сообщения у Романа, копией которого является сообщение помощника (None — не копия)."""
+    return _origin.get((chat_id, message_id))
 
 
 def answer_callback_query(callback_query_id: str, text: str = "") -> None:
@@ -85,8 +158,10 @@ def answer_callback_query(callback_query_id: str, text: str = "") -> None:
 
 
 def edit_message_reply_markup(chat_id: int, message_id: int, reply_markup: dict | None = None) -> None:
-    _call("editMessageReplyMarkup", {"chat_id": chat_id, "message_id": message_id, "reply_markup": reply_markup or {}},
-          raise_errors=False)
+    payload = {"chat_id": chat_id, "message_id": message_id, "reply_markup": reply_markup or {}}
+    _call("editMessageReplyMarkup", payload, raise_errors=False)
+    if chat_id == ADMIN_ID:
+        _edit_copies("editMessageReplyMarkup", message_id, payload)
 
 
 def edit_message_text(chat_id: int, message_id: int, text: str, reply_markup: dict | None = None) -> None:
@@ -99,6 +174,8 @@ def edit_message_text(chat_id: int, message_id: int, text: str, reply_markup: di
         # "message is not modified" — безобидно (тот же вариант нажат повторно), остальное показываем
         if "not modified" not in str(e):
             raise
+    if chat_id == ADMIN_ID:
+        _edit_copies("editMessageText", message_id, payload)
 
 
 def inline_keyboard(buttons: list[tuple[str, str]]) -> dict:

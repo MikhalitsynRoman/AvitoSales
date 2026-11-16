@@ -38,13 +38,149 @@ HELP_TEXT = (
     "/week — расписание на неделю (показать или задать: /week ср 14:00-16:00 пт 16-22 сб 11-22)\n"
     "/price около 1000 ₽ за час — что отвечать на вопрос о цене (/price без текста — не называть цену)\n"
     "/zoom https://… — ссылка Zoom для подтверждения записи\n"
-    "/booked Имя | Телефон | Когда | Класс | chat_id — записать на пробный"
+    "/booked Имя | Телефон | Когда | Класс | chat_id — записать на пробный\n"
+    "/team — кто ещё получает заявки. Помощнику: открыть этого бота и отправить /join, вам придёт запрос"
 )
+
+MEMBER_HELP = (
+    "Вы подключены к рабочему боту Романа: сюда приходят те же заявки с Avito и уведомления, что и ему.\n"
+    "• «✅ Отправить» — ответ сразу уходит клиенту в Avito.\n"
+    "• «❌ Исправить» — другие варианты ответа.\n"
+    "• Свой текст — ответьте (reply) на карточку клиента.\n"
+    "• /status — как сейчас работает бот.\n"
+    "Роман видит, что вы отправили клиентам. Настройки и доступы меняет только он."
+)
+# команды, которые меняют настройки бота, — только для Романа
+OWNER_ONLY = ("/auto", "/ai", "/week", "/zoom", "/price", "/team")
 
 # Статистика процесса для /status (в памяти, сбрасывается при перезапуске)
 _stats = {"started": "", "host": "", "last_check": 0.0, "check_secs": 0.0, "avito_fails": 0, "errors": []}
 _variant_msgs = {}  # row_id -> message_id уже открытого экрана вариантов (чтобы не слать его повторно)
 _notified_msgs = set()  # id сообщений Avito, по которым карточка уже ушла в этом процессе
+
+
+# ---------- Помощники: получают всё то же, что и Роман (16.11, по просьбе Романа) ----------
+# Человек пишет боту /join → Роману приходит запрос с кнопками → после «Открыть доступ» его id попадает
+# в state "team", и telegram_api копирует ему всё, что бот пишет Роману.
+
+def _team() -> dict:
+    try:
+        return {int(k): v for k, v in json.loads(sheets.get_state("team", "") or "{}").items()}
+    except (ValueError, AttributeError, TypeError):
+        return {}
+
+
+def _save_team(team: dict) -> None:
+    sheets.set_state("team", json.dumps({str(k): v for k, v in team.items()}, ensure_ascii=False))
+
+
+tg.team_ids = lambda: list(_team())
+
+
+def _person_name(frm: dict) -> str:
+    name = " ".join(x for x in (frm.get("first_name"), frm.get("last_name")) if x) or "Без имени"
+    return name + (f" (@{frm['username']})" if frm.get("username") else "")
+
+
+def _handle_stranger(msg: dict) -> None:
+    chat = msg.get("chat", {})
+    cid = chat.get("id")
+    if chat.get("type") != "private" or not cid:
+        return
+    text = (msg.get("text") or "").strip()
+    if not text.startswith("/join"):
+        if text.startswith("/start"):
+            tg.send_direct(cid, "Это рабочий бот Романа для заявок с Avito. Если Роман попросил вас помогать, "
+                                "отправьте /join — он получит запрос и откроет доступ.")
+        return
+    if _same_day(sheets.get_state(f"join_{cid}", "").split("|")[0], today_str()):
+        tg.send_direct(cid, "Запрос уже у Романа. Как только он откроет доступ, я напишу сюда.")
+        return
+    name = _person_name(msg.get("from") or {})
+    sheets.set_state(f"join_{cid}", f"{today_str()}|{name}")
+    tg.send_direct(
+        ADMIN_ID,
+        f"👤 {name} (id {cid}) просит доступ к боту.\n\n"
+        "Если открыть, он будет получать всё то же, что и вы: карточки клиентов с перепиской, записи, "
+        "предупреждения. И сможет нажимать кнопки, то есть отправлять ответы клиентам в Avito.\n"
+        "Настройки (/auto, /ai, /week, /zoom, /price, свободное время) и доступы останутся только у вас.",
+        tg.inline_keyboard([("✅ Открыть доступ", f"team_ok:{cid}"), ("❌ Отказать", f"team_no:{cid}")]),
+    )
+    tg.send_direct(cid, "Отправил запрос Роману. Как только он откроет доступ, я напишу сюда.")
+
+
+def _team_text() -> str:
+    team = _team()
+    if not team:
+        return ("Сейчас заявки получаете только вы.\n"
+                "Чтобы подключить помощника: пусть он откроет этого бота и отправит /join — вам придёт запрос.")
+    return ("Кроме вас заявки получают:\n" + "\n".join(f"• {n}" for n in team.values()) +
+            "\n\nНовый помощник: открыть этого бота и отправить /join.")
+
+
+def _team_buttons() -> dict | None:
+    team = _team()
+    if not team:
+        return None
+    return tg.keyboard_rows([[(f"🚫 Закрыть доступ: {n[:30]}", f"team_rm:{cid}")] for cid, n in team.items()])
+
+
+def _team_callback(cq: dict, action: str, rest: str, message_id: int) -> None:
+    try:
+        cid = int(rest)
+    except ValueError:
+        tg.answer_callback_query(cq["id"])
+        return
+    team = _team()
+    name = sheets.get_state(f"join_{cid}", "").partition("|")[2] or team.get(cid) or f"id {cid}"
+    if action == "team_ok":
+        if cid not in team:
+            team[cid] = name
+            _save_team(team)
+            tg.send_direct(cid, "✅ Роман открыл вам доступ.\n\n" + MEMBER_HELP)
+        tg.answer_callback_query(cq["id"], "Доступ открыт")
+        tg.edit_message_text(ADMIN_ID, message_id, f"✅ Доступ открыт: {name}. Теперь он получает всё то же, "
+                                                   "что и вы.\nЗакрыть доступ: /team", {"inline_keyboard": []})
+    elif action == "team_no":
+        tg.answer_callback_query(cq["id"], "Отказано")
+        tg.edit_message_text(ADMIN_ID, message_id, f"❌ Не дал доступ: {name}.", {"inline_keyboard": []})
+    elif action == "team_rm":
+        if team.pop(cid, None) is not None:
+            _save_team(team)
+            tg.send_direct(cid, "Роман закрыл вам доступ к заявкам — больше сюда ничего не придёт.")
+        tg.answer_callback_query(cq["id"], "Доступ закрыт")
+        tg.edit_message_text(ADMIN_ID, message_id, f"🚫 Закрыл доступ: {name}.\n\n" + _team_text(),
+                             _team_buttons() or {"inline_keyboard": []})
+
+
+def _member_message(chat_id: int, who: str, msg: dict) -> dict | None:
+    """Сообщение помощника: на справку/статус отвечаем только ему; настройки не даём; reply на копию карточки
+    переводим на карточку Романа. Возвращает сообщение для обычной обработки или None, если уже ответили."""
+    text = (msg.get("text") or "").strip()
+    if not text:
+        return None
+    if text.startswith(("/start", "/help", "/join")):
+        tg.send_direct(chat_id, MEMBER_HELP)
+        return None
+    if text.startswith("/status"):
+        tg.send_direct(chat_id, status_text())
+        return None
+    if text.startswith(OWNER_ONLY):
+        tg.send_direct(chat_id, "Это меняет только Роман.")
+        return None
+    reply_to = msg.get("reply_to_message")
+    if reply_to:
+        orig = tg.to_admin_message(chat_id, reply_to.get("message_id"))
+        if not orig:
+            tg.send_direct(chat_id, "Не понял, к какой заявке это ответ. Ответьте (reply) на карточку клиента.")
+            return None
+        if str(orig) == sheets.get_state("slots_prompt_msg_id", ""):
+            tg.send_direct(chat_id, "Свободное время задаёт только Роман.")
+            return None
+        msg = {**msg, "reply_to_message": {**reply_to, "message_id": orig}}
+    # Роман не видит, что помощник пишет боту, — показываем ему (ответ бота придёт обоим)
+    tg.send_direct(ADMIN_ID, f"👤 {who} пишет боту: «{text[:300]}»")
+    return msg
 
 
 def _now() -> str:
@@ -364,11 +500,31 @@ def handle_callback(user_id: int, cq: dict) -> None:
     chat_id = msg.get("chat", {}).get("id")
     message_id = msg.get("message_id")
 
-    if chat_id != ADMIN_ID or data == "noop":
+    if data == "noop":
         tg.answer_callback_query(cq["id"])
         return
-
     action, _, rest = data.partition(":")
+
+    if chat_id == ADMIN_ID and action in ("team_ok", "team_no", "team_rm"):
+        _team_callback(cq, action, rest, message_id)
+        return
+    if chat_id != ADMIN_ID:
+        who = _team().get(chat_id)
+        if not who or action.startswith("team"):
+            tg.answer_callback_query(cq["id"])
+            return
+        if action == "slots":
+            tg.answer_callback_query(cq["id"], "Свободное время задаёт только Роман")
+            return
+        orig = tg.to_admin_message(chat_id, message_id)
+        if not orig:
+            tg.answer_callback_query(cq["id"], "Эта карточка пришла до вашего доступа — дождитесь новой")
+            return
+        chat_id, message_id = ADMIN_ID, orig  # дальше — как будто нажал Роман: карточка обновится у всех
+        if action in ("send", "sv", "to", "now"):
+            v0 = (sheets.get_contact_by_id(rest.split(":")[0]) or {}).get("values") or {}
+            if v0 and not _is_sent(v0):
+                tg.send_direct(ADMIN_ID, f"👤 {who} отправляет ответ клиенту {v0.get('Имя', '')}.")
 
     if action in ("slots", "tcancel"):  # кнопки вопроса «Кому отправить этот текст?»
         tg.answer_callback_query(cq["id"])
@@ -576,8 +732,16 @@ def _save_slots(text: str) -> None:
 
 
 def handle_message(user_id: int, msg: dict) -> None:
-    if msg.get("chat", {}).get("id") != ADMIN_ID:
-        return
+    chat_id = msg.get("chat", {}).get("id")
+    owner = chat_id == ADMIN_ID
+    if not owner:
+        team = _team()
+        if chat_id not in team:
+            _handle_stranger(msg)
+            return
+        msg = _member_message(chat_id, team[chat_id], msg)
+        if msg is None:
+            return
     text = (msg.get("text") or "").strip()
     if not text:
         return
@@ -588,6 +752,15 @@ def handle_message(user_id: int, msg: dict) -> None:
 
     if text.startswith("/status"):
         tg.send_message(ADMIN_ID, status_text())
+        return
+
+    if text.startswith("/team"):
+        tg.send_direct(ADMIN_ID, _team_text(), _team_buttons())
+        return
+
+    if text.startswith("/join"):
+        tg.send_direct(ADMIN_ID, "Это команда для помощника: он отправляет /join в этом боте, а вам приходит "
+                                 "запрос.\n\n" + _team_text())
         return
 
     if text.startswith("/week"):
@@ -674,12 +847,12 @@ def handle_message(user_id: int, msg: dict) -> None:
     # Только часы («15:00, 18:30», «сегодня 13:00 и 15:00») — это свободное время. Любой другой текст скорее всего
     # ответ клиенту, написанный без reply, — спрашиваем кнопками, кому его отправить.
     # «в среду с 14 до 16, в пятницу с 16 до 22…» — расписание на неделю (минимум два дня с часами)
-    week = parse_week(text)
+    week = parse_week(text) if owner else {}
     if len(week) >= 2:
         _save_week(week)
         return
     leftover = re.sub(r"[^a-zа-яё]", "", TIME_RE.sub("", text.lower()))
-    if TIME_RE.search(text) and len(leftover) <= 12:
+    if owner and TIME_RE.search(text) and len(leftover) <= 12:
         _save_slots(text)
         return
     _ask_whom(text)
