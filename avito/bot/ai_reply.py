@@ -1,9 +1,9 @@
-"""Ответ клиенту «по смыслу» через YandexGPT (Yandex AI Studio).
+"""Ответ клиенту «по смыслу» через DeepSeek (api.deepseek.com, OpenAI-совместимый HTTP API).
 
 Модель читает всю переписку, правила Романа и свободные окна и решает: ответить, записать на окно или отдать
 Роману. Бот не доверяет ей вслепую — каждый ответ проходит проверку (validate), и при любом сомнении бот
-отвечает по правилам script_engine, как раньше. Ключ и каталог — в переменных YC_API_KEY и YC_FOLDER_ID
-(файл credentials/.env на хостинге); без них модуль просто выключен. Запросы — обычный HTTP через requests.
+отвечает по правилам script_engine, как раньше. Ключ — в переменной DEEPSEEK_API_KEY (файл credentials/.env
+на хостинге); без него модуль просто выключен. 16.11 Роман выбрал DeepSeek вместо YandexGPT.
 """
 import json
 import os
@@ -15,7 +15,7 @@ import requests
 
 from script_engine import MSK, TIME_RE, ZOOM_MARK, booking_key, category_text, day_label
 
-MODEL_NAME = os.getenv("YC_MODEL", "yandexgpt")  # YandexGPT Pro; «yandexgpt-lite» — дешевле, но слабее
+MODEL_NAME = os.getenv("DEEPSEEK_MODEL", "deepseek-v4-pro")  # «deepseek-flash» — дешевле, но слабее
 MAX_CALLS_PER_DAY = 300   # страховка от счёта: дальше — ответы по правилам
 HISTORY_MESSAGES = 30
 ALLOWED_PRICES = {"500", "660", "1000", "12000", "12 000"}
@@ -65,14 +65,15 @@ SYSTEM_PROMPT = """Ты — Роман, репетитор по профильн
 
 _usage = {"day": "", "calls": 0, "tokens_in": 0, "tokens_out": 0, "fails": 0}
 
-# OpenAI-совместимый HTTP API Yandex AI Studio — тот же, что у официального SDK (sdk.chat: _utils/http.py и
-# _chat/completions/model.py в yandex-cloud-ml-sdk). Через gRPC (sdk.models) 16.11 процесс бота на хостинге падал.
-API_URL = "https://llm.api.cloud.yandex.net/v1/chat/completions"
-REQUEST_TIMEOUT = 40
+# api-docs.deepseek.com: POST /chat/completions, Authorization: Bearer; JSON-режим — response_format json_object,
+# в промпте должно быть слово «json» и пример формата (есть в SYSTEM_PROMPT); content иногда приходит пустым —
+# тогда один повтор. Размышления (thinking) выключены: ответ нужен быстро и строго в JSON.
+API_URL = "https://api.deepseek.com/chat/completions"
+REQUEST_TIMEOUT = 60
 
 
 def available() -> bool:
-    return bool(os.getenv("YC_API_KEY") and os.getenv("YC_FOLDER_ID"))
+    return bool(os.getenv("DEEPSEEK_API_KEY"))
 
 
 def usage() -> dict:
@@ -86,24 +87,26 @@ class _Result:
 
 def _call(messages: list[dict], max_tokens: int = 800) -> _Result:
     body = {
-        "model": f"gpt://{os.environ['YC_FOLDER_ID']}/{MODEL_NAME}/latest",
+        "model": MODEL_NAME,
         "messages": [{"role": m["role"], "content": m["text"]} for m in messages],
         "temperature": 0.3,
         "max_tokens": max_tokens,
         "response_format": {"type": "json_object"},
+        "thinking": {"type": "disabled"},
         "stream": False,
     }
-    headers = {
-        "authorization": f"Api-Key {os.environ['YC_API_KEY']}",
-        "x-data-logging-enabled": "false",  # не даём Yandex сохранять переписку клиентов
-    }
-    resp = requests.post(API_URL, json=body, headers=headers, timeout=REQUEST_TIMEOUT)
-    if not resp.ok:
-        raise RuntimeError(f"YandexGPT {resp.status_code}: {resp.text[:200]}")
-    data = resp.json()
-    u = data.get("usage") or {}
-    return _Result(data["choices"][0]["message"]["content"] or "", u.get("prompt_tokens", 0) or 0,
-                   u.get("completion_tokens", 0) or 0, data.get("model", ""))
+    headers = {"Authorization": f"Bearer {os.environ['DEEPSEEK_API_KEY']}", "Content-Type": "application/json"}
+    for attempt in (1, 2):
+        resp = requests.post(API_URL, json=body, headers=headers, timeout=REQUEST_TIMEOUT)
+        if not resp.ok:
+            hint = {401: "неверный ключ", 402: "закончился баланс", 429: "слишком часто"}.get(resp.status_code, "")
+            raise RuntimeError(f"DeepSeek {resp.status_code} {hint}: {resp.text[:200]}")
+        data = resp.json()
+        text = (data["choices"][0]["message"].get("content") or "").strip()
+        if text or attempt == 2:
+            u = data.get("usage") or {}
+            return _Result(text, u.get("prompt_tokens", 0) or 0, u.get("completion_tokens", 0) or 0,
+                           data.get("model", ""))
 
 
 def _schedule_text(schedule: dict | None, today: date) -> str:
@@ -252,6 +255,7 @@ def ai_reply(name: str, dialog: list[dict], a: dict, schedule: dict | None, pric
         result = json.loads(raw)
     except Exception as e:  # сеть, ключ, неверный JSON — всё это не повод молчать: ответим по правилам
         _usage["fails"] += 1
+        _usage["last_error"] = str(e)[:200]
         print(f"AI_FAIL ({time.time() - t0:.1f}s): {type(e).__name__}: {str(e)[:200]}")
         return None
     ok, why = validate(result, schedule)

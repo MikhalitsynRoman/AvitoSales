@@ -34,7 +34,7 @@ HELP_TEXT = (
     "Команды:\n"
     "/status — работает ли бот, заявки и записи за сегодня, свободные окна\n"
     "/auto on | /auto off — отвечать клиентам самому (в понятных ситуациях) или только через вас\n"
-    "/ai on | /ai off — отвечать по смыслу через YandexGPT или только по правилам\n"
+    "/ai on | /ai off — отвечать по смыслу через DeepSeek или только по правилам\n"
     "/week — расписание на неделю (показать или задать: /week ср 14:00-16:00 пт 16-22 сб 11-22)\n"
     "/price около 1000 ₽ за час — что отвечать на вопрос о цене (/price без текста — не называть цену)\n"
     "/zoom https://… — ссылка Zoom для подтверждения записи\n"
@@ -502,9 +502,9 @@ def status_text() -> str:
                  f" · ждут отправки: {len(_pending_auto)}")
     u = ai_reply.usage()
     if not ai_reply.available():
-        lines.append("🧠 YandexGPT: не подключён (нет ключа YC_API_KEY / YC_FOLDER_ID) — отвечаю по правилам")
+        lines.append("🧠 DeepSeek: не подключён (нет ключа DEEPSEEK_API_KEY) — отвечаю по правилам")
     else:
-        lines.append(f"🧠 YandexGPT: {'включён' if _ai_enabled() else 'выключен (/ai on)'} · сегодня запросов {u['calls']}, "
+        lines.append(f"🧠 DeepSeek: {'включён' if _ai_enabled() else 'выключен (/ai on)'} · сегодня запросов {u['calls']}, "
                      f"не удалось {u['fails']}, токенов {u['tokens_in']}+{u['tokens_out']}")
     if ago is None:
         lines.append("Avito ещё не проверялся после запуска")
@@ -608,10 +608,10 @@ def handle_message(user_id: int, msg: dict) -> None:
         if arg in ("on", "off"):
             sheets.set_state("ai_mode", arg)
         if not ai_reply.available():
-            tg.send_message(ADMIN_ID, "🧠 YandexGPT не подключён: на хостинге нет ключа (YC_API_KEY и YC_FOLDER_ID в "
+            tg.send_message(ADMIN_ID, "🧠 DeepSeek не подключён: на хостинге нет ключа (DEEPSEEK_API_KEY в "
                                       "credentials/.env). Пока отвечаю по правилам.")
         else:
-            tg.send_message(ADMIN_ID, f"🧠 YandexGPT {'включён' if _ai_enabled() else 'выключен'}. Когда включён — "
+            tg.send_message(ADMIN_ID, f"🧠 DeepSeek {'включён' if _ai_enabled() else 'выключен'}. Когда включён — "
                                       "отвечаю по смыслу переписки, а если модель не справилась — по правилам.\n"
                                       "/ai on — включить, /ai off — только правила.")
         return
@@ -955,7 +955,7 @@ def process_due_autos(user_id: int) -> None:
 
 
 def _ai_enabled() -> bool:
-    # по умолчанию выключено: 16.11 вызов через gRPC ронял процесс на хостинге, пока не перейдём на HTTP
+    # включается командой /ai on (state ai_mode); работает, только если на хостинге есть DEEPSEEK_API_KEY
     return sheets.get_state("ai_mode", "off") == "on" and ai_reply.available()
 
 
@@ -988,11 +988,17 @@ def _notify_client(user_id: int, chat_id: str, name: str, city: str, avito_msg_i
     # один клиент — одна строка: если он уже писал, обновляем его строку, а старую карточку гасим
     existing = sheets.find_contact_by_chat(chat_id)
     row_id = existing["values"]["id"] if existing and existing["values"]["id"] else sheets.new_row_id()
-    # 🧠 YandexGPT отвечает по смыслу всей переписки; правила — страховка и запасной вариант, если модель
+    # 🧠 DeepSeek отвечает по смыслу всей переписки; правила — страховка и запасной вариант, если модель
     # недоступна или её ответ не прошёл проверку (ai_reply.validate)
     ai, ai_tag, hard = None, "", _hard_manual_reason(a)
     if allow_auto and _ai_enabled() and not hard:
         ai = ai_reply.ai_reply(name, dialog, a, schedule(), sheets.get_state("price_hint", ""), variants[0])
+        err = ai_reply.usage().get("last_error", "")
+        if not ai and ("402" in err or "401" in err) and sheets.get_state("ai_alert_day", "") != today_str():
+            sheets.set_state("ai_alert_day", today_str())  # не чаще раза в день
+            tg.send_message(ADMIN_ID, "⚠️ DeepSeek не отвечает: " + ("закончился баланс — пополните на "
+                            "platform.deepseek.com/top_up" if "402" in err else "ключ не подходит — проверьте DEEPSEEK_API_KEY")
+                            + ". Пока отвечаю клиентам по правилам.")
     if ai and ai["action"] in ("reply", "book"):
         if ai["action"] == "book":
             d, t = ai["date_obj"], ai["time"]
@@ -1010,7 +1016,7 @@ def _notify_client(user_id: int, chat_id: str, name: str, city: str, avito_msg_i
     auto_ok, why = (False, "")
     if allow_auto and _auto_enabled():
         if ai and ai["action"] == "manual":
-            auto_ok, why = False, "YandexGPT считает, что лучше ответить вам: " + (ai.get("reason") or "нестандартный вопрос")
+            auto_ok, why = False, "DeepSeek считает, что лучше ответить вам: " + (ai.get("reason") or "нестандартный вопрос")
         elif ai:
             auto_ok, why = True, ""
         else:
@@ -1177,8 +1183,8 @@ def main() -> None:
     # уже отправленные карточки (есть в таблице) второй раз не шлём и после перезапуска
     _notified_msgs.update(sheets.get_logged_msg_ids())
     _load_pending_auto()  # автоответы, назначенные до перезапуска
-    # видно в «Состоянии»: есть ли ключ YandexGPT и отвечает ли модель (сам ключ не пишем)
-    test = ai_reply.ping() if _ai_enabled() else "не проверял (YandexGPT выключен)"
+    # видно в «Состоянии»: есть ли ключ DeepSeek и отвечает ли модель (сам ключ не пишем)
+    test = ai_reply.ping() if _ai_enabled() else "не проверял (DeepSeek выключен)"
     sheets.set_state("ai_diag", f"{_now()}: HTTP API; ключ {'есть' if ai_reply.available() else 'нет'}; "
                                 f"тестовый запрос: {test}")
     if RUN_SECONDS and len(sheets._load_state()) > 1500:
