@@ -1177,13 +1177,9 @@ def main() -> None:
     # уже отправленные карточки (есть в таблице) второй раз не шлём и после перезапуска
     _notified_msgs.update(sheets.get_logged_msg_ids())
     _load_pending_auto()  # автоответы, назначенные до перезапуска
-    try:  # видно в «Состоянии»: поставился ли SDK на хостинге и есть ли ключ (сам ключ не пишем)
-        import yandex_ai_studio_sdk
-        sdk_state = f"SDK {getattr(yandex_ai_studio_sdk, '__version__', 'есть')}"
-    except Exception as e:
-        sdk_state = f"SDK не установлен ({type(e).__name__})"
+    # видно в «Состоянии»: есть ли ключ YandexGPT и отвечает ли модель (сам ключ не пишем)
     test = ai_reply.ping() if _ai_enabled() else "не проверял (YandexGPT выключен)"
-    sheets.set_state("ai_diag", f"{_now()}: {sdk_state}; ключ {'есть' if ai_reply.available() else 'нет'}; "
+    sheets.set_state("ai_diag", f"{_now()}: HTTP API; ключ {'есть' if ai_reply.available() else 'нет'}; "
                                 f"тестовый запрос: {test}")
     if RUN_SECONDS and len(sheets._load_state()) > 1500:
         try:

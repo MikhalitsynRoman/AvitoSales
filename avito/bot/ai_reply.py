@@ -3,13 +3,15 @@
 Модель читает всю переписку, правила Романа и свободные окна и решает: ответить, записать на окно или отдать
 Роману. Бот не доверяет ей вслепую — каждый ответ проходит проверку (validate), и при любом сомнении бот
 отвечает по правилам script_engine, как раньше. Ключ и каталог — в переменных YC_API_KEY и YC_FOLDER_ID
-(файл credentials/.env на хостинге); без них модуль просто выключен.
+(файл credentials/.env на хостинге); без них модуль просто выключен. Запросы — обычный HTTP через requests.
 """
 import json
 import os
 import re
 import time
 from datetime import date, datetime
+
+import requests
 
 from script_engine import MSK, TIME_RE, ZOOM_MARK, booking_key, category_text, day_label
 
@@ -61,8 +63,12 @@ SYSTEM_PROMPT = """Ты — Роман, репетитор по профильн
 {"action": "reply" | "book" | "manual", "text": "сообщение клиенту (для reply)", "date": "ДД.ММ.ГГГГ (для book)", \
 "time": "ЧЧ:ММ (для book)", "reason": "коротко, почему manual"}"""
 
-_sdk = None
 _usage = {"day": "", "calls": 0, "tokens_in": 0, "tokens_out": 0, "fails": 0}
+
+# OpenAI-совместимый HTTP API Yandex AI Studio — тот же, что у официального SDK (sdk.chat: _utils/http.py и
+# _chat/completions/model.py в yandex-cloud-ml-sdk). Через gRPC (sdk.models) 16.11 процесс бота на хостинге падал.
+API_URL = "https://llm.api.cloud.yandex.net/v1/chat/completions"
+REQUEST_TIMEOUT = 40
 
 
 def available() -> bool:
@@ -73,12 +79,31 @@ def usage() -> dict:
     return dict(_usage)
 
 
-def _model():
-    global _sdk
-    from yandex_ai_studio_sdk import AIStudio  # импорт здесь: без ключа и пакета бот работает как раньше
-    if _sdk is None:
-        _sdk = AIStudio(folder_id=os.environ["YC_FOLDER_ID"], auth=os.environ["YC_API_KEY"])
-    return _sdk.models.completions(MODEL_NAME).configure(temperature=0.3, max_tokens=800, response_format="json")
+class _Result:
+    def __init__(self, text: str, tokens_in: int, tokens_out: int, model: str):
+        self.text, self.tokens_in, self.tokens_out, self.model = text, tokens_in, tokens_out, model
+
+
+def _call(messages: list[dict], max_tokens: int = 800) -> _Result:
+    body = {
+        "model": f"gpt://{os.environ['YC_FOLDER_ID']}/{MODEL_NAME}/latest",
+        "messages": [{"role": m["role"], "content": m["text"]} for m in messages],
+        "temperature": 0.3,
+        "max_tokens": max_tokens,
+        "response_format": {"type": "json_object"},
+        "stream": False,
+    }
+    headers = {
+        "authorization": f"Api-Key {os.environ['YC_API_KEY']}",
+        "x-data-logging-enabled": "false",  # не даём Yandex сохранять переписку клиентов
+    }
+    resp = requests.post(API_URL, json=body, headers=headers, timeout=REQUEST_TIMEOUT)
+    if not resp.ok:
+        raise RuntimeError(f"YandexGPT {resp.status_code}: {resp.text[:200]}")
+    data = resp.json()
+    u = data.get("usage") or {}
+    return _Result(data["choices"][0]["message"]["content"] or "", u.get("prompt_tokens", 0) or 0,
+                   u.get("completion_tokens", 0) or 0, data.get("model", ""))
 
 
 def _schedule_text(schedule: dict | None, today: date) -> str:
@@ -192,13 +217,13 @@ def ping() -> str:
     """Короткий тестовый запрос без данных клиентов — проверить ключ и связь при запуске бота."""
     t0 = time.time()
     try:
-        res = _model().run([
+        res = _call([
             {"role": "system", "text": 'Ответь строго JSON: {"ok": true}'},
             {"role": "user", "text": "проверка связи"},
-        ])
+        ], max_tokens=30)
         ok = "true" in res.text.lower()
-        return (f"{'работает' if ok else 'ответ странный'}, {time.time() - t0:.1f} с, модель "
-                f"{getattr(res, 'model_version', '?')}: {res.text.strip()[:60]}")
+        return (f"{'работает' if ok else 'ответ странный'}, {time.time() - t0:.1f} с, модель {res.model or '?'}: "
+                f"{res.text.strip()[:60]}")
     except Exception as e:
         return f"ошибка за {time.time() - t0:.1f} с: {type(e).__name__}: {str(e)[:200]}"
 
@@ -216,13 +241,12 @@ def ai_reply(name: str, dialog: list[dict], a: dict, schedule: dict | None, pric
     _usage["calls"] += 1
     t0 = time.time()
     try:
-        res = _model().run([
+        res = _call([
             {"role": "system", "text": SYSTEM_PROMPT},
             {"role": "user", "text": build_user_message(name, dialog, a, schedule, price_hint, rule_draft)},
         ])
-        u = getattr(res, "usage", None)
-        _usage["tokens_in"] += getattr(u, "input_text_tokens", 0) or 0
-        _usage["tokens_out"] += getattr(u, "completion_tokens", 0) or 0
+        _usage["tokens_in"] += res.tokens_in
+        _usage["tokens_out"] += res.tokens_out
         raw = res.text.strip()
         raw = raw[raw.find("{"): raw.rfind("}") + 1]
         result = json.loads(raw)
