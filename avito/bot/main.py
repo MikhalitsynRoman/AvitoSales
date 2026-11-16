@@ -955,7 +955,8 @@ def process_due_autos(user_id: int) -> None:
 
 
 def _ai_enabled() -> bool:
-    return sheets.get_state("ai_mode", "on") == "on" and ai_reply.available()
+    # по умолчанию выключено: 16.11 вызов через gRPC ронял процесс на хостинге, пока не перейдём на HTTP
+    return sheets.get_state("ai_mode", "off") == "on" and ai_reply.available()
 
 
 def _hard_manual_reason(a: dict) -> str:
@@ -1181,7 +1182,7 @@ def main() -> None:
         sdk_state = f"SDK {getattr(yandex_ai_studio_sdk, '__version__', 'есть')}"
     except Exception as e:
         sdk_state = f"SDK не установлен ({type(e).__name__})"
-    test = ai_reply.ping() if ai_reply.available() else "не проверял"
+    test = ai_reply.ping() if _ai_enabled() else "не проверял (YandexGPT выключен)"
     sheets.set_state("ai_diag", f"{_now()}: {sdk_state}; ключ {'есть' if ai_reply.available() else 'нет'}; "
                                 f"тестовый запрос: {test}")
     if RUN_SECONDS and len(sheets._load_state()) > 1500:
