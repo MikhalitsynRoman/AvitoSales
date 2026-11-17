@@ -1673,6 +1673,11 @@ def main() -> None:
         sheets.set_state("amo_diag", f"{_now()}: {amo_short}")
         if amo_pipes:
             sheets.set_state("amo_pipelines", amo_pipes)
+        q = sheets.get_state("amo_lookup_q", "")
+        if q and amo_crm.ready():  # разовая проверка: запрос кладётся в «Состояние», ответ — туда же
+            sheets.set_state("amo_lookup_result", f"{_now()} «{q}»:\n" + "\n\n".join(
+                amo_crm.lookup(part.strip()) for part in q.split("|") if part.strip()))
+            sheets.set_state("amo_lookup_q", "")
         if amo_crm.ready():
             known = {c["Имя"].strip().lower() for c in sheets.all_contacts() if c.get("Имя")}
             sheets.set_state("amo_avito_diag", f"{_now()}\n" + amo_crm.avito_channel_diag(known))

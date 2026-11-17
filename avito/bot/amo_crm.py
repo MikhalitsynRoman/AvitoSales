@@ -294,6 +294,30 @@ def avito_channel_diag(known_names: set) -> str:
     return "\n".join(out) or "за 3 дня сделок нет"
 
 
+def lookup(query: str) -> str:
+    """Только чтение, для проверок: контакты по запросу и их сделки (воронка / этап / когда создана)."""
+    names = {}
+    for p in pipelines():
+        for s in p["statuses"]:
+            names[(p["id"], s["id"])] = f"{p['name']} / {s['name']}"
+    out = []
+    data = _get("contacts", {"query": query, "with": "leads", "limit": 20})
+    for c in (data.get("_embedded") or {}).get("contacts", []):
+        out.append(f"контакт #{c['id']} «{c.get('name', '')}»")
+        for lead in (c.get("_embedded") or {}).get("leads", []):
+            full = _get(f"leads/{lead['id']}")
+            out.append(f"   сделка #{full['id']} «{full.get('name', '')}» · "
+                       f"{names.get((full.get('pipeline_id'), full.get('status_id')), full.get('status_id'))} · "
+                       f"создана {time.strftime('%d.%m %H:%M', time.localtime(full.get('created_at', 0)))}")
+    uns = _get("leads/unsorted", {"limit": 50})
+    for u in (uns.get("_embedded") or {}).get("unsorted", []):
+        md = u.get("metadata") or {}
+        cname = (md.get("client") or {}).get("name", "") if isinstance(md.get("client"), dict) else ""
+        if query.lower() in f"{cname} {md.get('from', '')}".lower():
+            out.append(f"неразобранное {u.get('uid', '')[:12]} «{cname or md.get('from', '')}»")
+    return "\n".join(out) or "ничего не нашёл"
+
+
 def diag() -> tuple[str, str]:
     """(короткая строка для «Состояния», описание воронок). Только чтение, без данных клиентов."""
     if not available():
