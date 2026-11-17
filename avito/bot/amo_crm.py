@@ -183,6 +183,41 @@ def close_lost(lead_id: int) -> str:
     return "закрыл"
 
 
+def avito_channel_diag(known_names: set) -> str:
+    """Только чтение: как выглядят сделки, которые создаёт штатный канал Avito в amoCRM, — чтобы бот находил их,
+    а не заводил вторые. Имён не выводим: только «совпадает ли имя контакта с клиентом из таблицы»."""
+    if not ready():
+        return "amoCRM не готов"
+    names = {}
+    for s in pipelines():
+        for st in s["statuses"]:
+            names[(s["id"], st["id"])] = f"{s['name']} / {st['name']}"
+    out = []
+    week = int(time.time()) - 3 * 86400
+    data = _get("leads", {"filter[created_at][from]": week, "with": "contacts,source_id", "limit": 50, "order[created_at]": "desc"})
+    for lead in (data.get("_embedded") or {}).get("leads", [])[:15]:
+        emb = lead.get("_embedded") or {}
+        tags = [t.get("name", "") for t in emb.get("tags", [])]
+        cons = emb.get("contacts", [])
+        match = "нет контакта"
+        if cons:
+            c = _get(f"contacts/{cons[0]['id']}")
+            cname = (c.get("name") or "").strip().lower()
+            match = "имя = клиент из таблицы" if cname and cname in known_names else "имя не из таблицы"
+        out.append(f"#{lead['id']} {time.strftime('%d.%m %H:%M', time.localtime(lead.get('created_at', 0)))} · "
+                   f"{names.get((lead.get('pipeline_id'), lead.get('status_id')), lead.get('status_id'))} · "
+                   f"теги {tags} · source_id {lead.get('source_id')} · создал {lead.get('created_by')} · {match}")
+    try:
+        uns = _get("leads/unsorted", {"limit": 10})
+        for u in (uns.get("_embedded") or {}).get("unsorted", []):
+            md = u.get("metadata") or {}
+            out.append(f"неразобранное: {u.get('category')} · источник {u.get('source_name')} · uid {u.get('source_uid', '')[:20]} · "
+                       f"поля metadata {sorted(md)}")
+    except Exception as e:
+        out.append(f"неразобранное: {str(e)[:120]}")
+    return "\n".join(out) or "за 3 дня сделок нет"
+
+
 def diag() -> tuple[str, str]:
     """(короткая строка для «Состояния», описание воронок). Только чтение, без данных клиентов."""
     if not available():

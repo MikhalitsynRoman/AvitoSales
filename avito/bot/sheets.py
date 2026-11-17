@@ -7,6 +7,49 @@ from google.oauth2.service_account import Credentials
 
 from config import CREDENTIALS_FILE, SPREADSHEET_ID
 
+# ---------- повторы при временных сбоях Google ----------
+# 17.11 15:34 Google ответил 503 «The service is currently unavailable» — процесс упал, бот лежал до следующего
+# запуска cron. Теперь каждый запрос к таблице при 429/5xx или обрыве связи повторяется: через 1, 3, 7 и 15 с.
+# Повторять записи безопасно: бот пишет в конкретные ячейки (а _append ещё и проверяет, что строка пуста).
+import time  # noqa: E402
+
+import requests  # noqa: E402
+
+RETRY_DELAYS = [1, 3, 7, 15]
+RETRY_CODES = {429, 500, 502, 503, 504}
+retry_stats = {"retries": 0, "last": ""}
+
+
+def _with_retries(orig):
+    def request(self, *args, **kwargs):
+        for attempt, delay in enumerate(RETRY_DELAYS + [None]):
+            try:
+                return orig(self, *args, **kwargs)
+            except gspread.exceptions.APIError as e:
+                code = getattr(getattr(e, "response", None), "status_code", None)
+                if code not in RETRY_CODES or delay is None:
+                    raise
+                why = f"Google {code}"
+            except (requests.ConnectionError, requests.Timeout) as e:
+                if delay is None:
+                    raise
+                why = type(e).__name__
+            retry_stats["retries"] += 1
+            retry_stats["last"] = f"{datetime.now():%d.%m %H:%M} {why}, повтор через {delay} с"
+            print("SHEETS RETRY:", retry_stats["last"])
+            time.sleep(delay)
+    return request
+
+
+# gspread 5 (хостинг) — Client.request, gspread 6 (ноутбук) — HTTPClient.request
+RETRY_PATCHED = []
+for _mod, _cls in (("client", "Client"), ("http_client", "HTTPClient")):
+    _klass = getattr(getattr(gspread, _mod, None), _cls, None)
+    if _klass is not None and "request" in _klass.__dict__ and not getattr(_klass.request, "_retries", False):
+        _klass.request = _with_retries(_klass.request)
+        _klass.request._retries = True
+        RETRY_PATCHED.append(f"gspread {gspread.__version__} {_cls}")
+
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive",

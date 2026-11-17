@@ -1493,6 +1493,8 @@ def main() -> None:
     _stats["host"] = "хостинг reg.ru" if "reg.ru" in host else host
     _stats["started"] = _now()
     sheets.set_state("last_start", f"{_now()} ({host})")
+    sheets.set_state("sheets_diag", f"{_now()}: повторы при сбоях Google: "
+                     + (", ".join(sheets.RETRY_PATCHED) or "НЕ ВКЛЮЧЕНЫ"))
     # 06.11 бот упал при запуске на коротком обрыве связи с Avito — даём ему три попытки, а не одну
     for attempt in range(3):
         try:
@@ -1519,6 +1521,9 @@ def main() -> None:
         sheets.set_state("amo_diag", f"{_now()}: {amo_short}")
         if amo_pipes:
             sheets.set_state("amo_pipelines", amo_pipes)
+        if amo_crm.ready():
+            known = {c["Имя"].strip().lower() for c in sheets.all_contacts() if c.get("Имя")}
+            sheets.set_state("amo_avito_diag", f"{_now()}\n" + amo_crm.avito_channel_diag(known))
     except Exception as e:
         _note_error("проверка amoCRM", e)
     if RUN_SECONDS and len(sheets._load_state()) > 1500:
