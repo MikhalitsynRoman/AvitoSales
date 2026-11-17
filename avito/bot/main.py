@@ -13,6 +13,7 @@ import client as avito_client  # noqa: E402
 import sheets  # noqa: E402
 import telegram_api as tg  # noqa: E402
 import ai_reply  # noqa: E402
+import amo_crm  # noqa: E402
 from script_engine import (TIME_RE, ZOOM_MARK, analyze_dialog, auto_decision, booking_key,  # noqa: E402
                            category_text, confirm_block, day_label, expand_slots, generate_variants, is_past)
 
@@ -1360,6 +1361,13 @@ def main() -> None:
     test = ai_reply.ping() if _ai_enabled() else "не проверял (DeepSeek выключен)"
     sheets.set_state("ai_diag", f"{_now()}: HTTP API; ключ {'есть' if ai_reply.available() else 'нет'}; "
                                 f"тестовый запрос: {test}")
+    try:  # amoCRM: пока только проверка ключа и чтение воронок (сам токен не пишем)
+        amo_short, amo_pipes = amo_crm.diag()
+        sheets.set_state("amo_diag", f"{_now()}: {amo_short}")
+        if amo_pipes:
+            sheets.set_state("amo_pipelines", amo_pipes)
+    except Exception as e:
+        _note_error("проверка amoCRM", e)
     if RUN_SECONDS and len(sheets._load_state()) > 1500:
         try:
             cleaned = sheets.compact_state({c["id"] for c in sheets.all_contacts() if c["id"]})
