@@ -91,7 +91,8 @@ def setup() -> str:
             missing.append(name)
     if missing:
         return "в воронке нет этапов: " + ", ".join(missing)
-    _pipe = {"id": p["id"], "order": [s["id"] for s in p["statuses"]], "stage": stage}
+    _pipe = {"id": p["id"], "order": [s["id"] for s in p["statuses"]], "stage": stage,
+             "unsorted": by_name.get("неразобранное")}
     return ""
 
 
@@ -124,15 +125,87 @@ def _open_lead_by_phone(phone: str) -> tuple[int | None, int | None]:
     for c in (data.get("_embedded") or {}).get("contacts", []):
         for lead in (c.get("_embedded") or {}).get("leads", []):
             full = _get(f"leads/{lead['id']}")
-            if full.get("pipeline_id") == _pipe["id"] and full.get("status_id") not in (WON, LOST):
+            if full.get("pipeline_id") == _pipe["id"] and full.get("status_id") not in (WON, LOST, _pipe["unsorted"]):
                 return full["id"], c["id"]
         return None, c["id"]
     return None, None
 
 
-def create_lead(name: str, city: str, phone: str | None, first_note: str, stage: str = "new") -> int:
-    """Сделка в «Продажа курса» с контактом. Если клиент с этим телефоном уже есть — берём его открытую сделку."""
+def _norm(s) -> str:
+    return re.sub(r"\s+", " ", str(s or "")).strip().lower()
+
+
+match_log = []  # последние решения «откуда взялась сделка» — main кладёт в state amo_match_log
+
+
+def _log_match(text: str) -> None:
+    match_log.append(f"{time.strftime('%d.%m %H:%M')} {text}")
+    del match_log[:-20]
+
+
+def _channel_lead(name: str, client_text: str, taken: set) -> tuple[int | None, str]:
+    """Штатный канал Avito в amoCRM (подключён у Романа) кладёт каждое обращение в «Неразобранное» воронки
+    «Продажа курса». Чтобы не было двух сделок на одного клиента, сначала ищем его там (и принимаем на «Новая заявка»),
+    потом — среди уже принятых за 3 дня открытых сделок с контактом с тем же именем."""
+    n = _norm(name)
+    if not n or n == "—":
+        return None, ""
+    data = _get("leads/unsorted", {"filter[pipeline_id]": _pipe["id"], "filter[category][]": "chats", "limit": 50})
+    cands = []
+    for u in (data.get("_embedded") or {}).get("unsorted", []):
+        if "avito" not in (_norm(u.get("source_name")) + _norm(u.get("source_uid"))):
+            continue
+        md = u.get("metadata") or {}
+        emb = u.get("_embedded") or {}
+        names = {_norm((md.get("client") or {}).get("name") if isinstance(md.get("client"), dict) else ""),
+                 _norm(md.get("from"))} | {_norm(c.get("name")) for c in emb.get("contacts", [])}
+        if n not in names:
+            continue
+        last = _norm(md.get("last_message_text"))
+        same_text = bool(last) and last[:40] in _norm(client_text)
+        cands.append(((same_text, md.get("received_at") or u.get("created_at") or 0), u))
+    if cands:
+        (same_text, _), best = max(cands, key=lambda x: x[0])
+        # одно обращение с таким именем — оно; несколько — только если совпал и текст сообщения
+        if len(cands) == 1 or same_text:
+            lead_ids = [x["id"] for x in (best.get("_embedded") or {}).get("leads", [])]
+            res = _req("POST", f"leads/unsorted/{best['uid']}/accept", body={"status_id": _pipe["stage"]["new"]})
+            lead_ids = [x["id"] for x in ((res or {}).get("_embedded") or {}).get("leads", [])] or lead_ids
+            if lead_ids:
+                _log_match(f"«{name}»: принял обращение из «Неразобранного» (канал Avito) → сделка #{lead_ids[0]}")
+                return lead_ids[0], "канал Avito"
+        _log_match(f"«{name}»: в «Неразобранном» {len(cands)} обращения с таким именем, текст не совпал — не угадываю")
+    # уже принятая (Романом) сделка с контактом с тем же именем
+    week_ago = int(time.time()) - 3 * 86400
+    data = _get("contacts", {"query": name, "with": "leads", "limit": 50})
+    found = []
+    for c in (data.get("_embedded") or {}).get("contacts", []):
+        if _norm(c.get("name")) != n:
+            continue
+        for lead in (c.get("_embedded") or {}).get("leads", []):
+            if lead["id"] in taken:
+                continue
+            full = _get(f"leads/{lead['id']}")
+            if (full.get("pipeline_id") == _pipe["id"] and full.get("status_id") not in (WON, LOST, _pipe["unsorted"])
+                    and (full.get("created_at") or 0) >= week_ago):
+                found.append(full["id"])
+    if len(found) == 1:
+        _log_match(f"«{name}»: нашёл уже принятую сделку #{found[0]}")
+        return found[0], "уже принятая сделка"
+    if found:
+        _log_match(f"«{name}»: открытых сделок с таким именем {len(found)} — не угадываю, создаю свою")
+    return None, ""
+
+
+def create_lead(name: str, city: str, phone: str | None, first_note: str, stage: str = "new",
+                client_text: str = "", taken: set = frozenset()) -> int:
+    """Сделка в «Продажа курса» с контактом. Сначала ищем, нет ли уже этого клиента: по телефону, в «Неразобранном»
+    от канала Avito, среди принятых сделок — и только если нет, создаём свою."""
     lead_id, contact_id = _open_lead_by_phone(phone) if phone else (None, None)
+    if lead_id and lead_id not in taken:
+        _log_match(f"«{name}»: нашёл открытую сделку #{lead_id} по телефону")
+    else:
+        lead_id = _channel_lead(name, client_text, taken)[0]
     if lead_id:
         note(lead_id, first_note)
         advance(lead_id, stage)
@@ -147,6 +220,7 @@ def create_lead(name: str, city: str, phone: str | None, first_note: str, stage:
     }])
     lead_id = res[0]["id"]
     stats["created"] += 1
+    _log_match(f"«{name}»: в amoCRM его нет — создал сделку #{lead_id}")
     note(lead_id, first_note)
     return lead_id
 
@@ -160,6 +234,8 @@ def advance(lead_id: int, stage: str) -> str:
         return "в другой воронке — не трогаю"
     if cur == WON:
         return "уже успешно реализовано — не трогаю"
+    if cur == _pipe["unsorted"]:
+        return "в «Неразобранном» — его принимают, а не двигают"
     if cur == LOST and stage != "booked":
         return "закрыта — не трогаю"
     order = _pipe["order"]

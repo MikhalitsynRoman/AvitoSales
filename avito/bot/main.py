@@ -482,8 +482,10 @@ def _log_trial_booking(row_id: str, v: dict) -> None:
         if not lead:  # клиент писал до подключения amoCRM — запись на пробный всё равно заводим сделкой
             lead = amo_crm.create_lead(v["Имя"], v["Город"], meta.get("phone"),
                                        _amo_first_note(v["Имя"], v["Город"], v["Категория"], v["chat_id"], ""),
-                                       stage="booked")
+                                       stage="booked", client_text=v.get("Сообщение клиента", ""),
+                                       taken=_amo_taken())
             sheets.set_state(f"amo_{row_id}", str(lead))
+            _amo_save_log()
         amo_crm.advance(lead, "booked")
         amo_crm.note(lead, f"Записан на пробный урок: {when} (мск). Ссылка Zoom отправлена.")
     _amo_safe("запись на пробный", amo_booked)
@@ -1228,6 +1230,15 @@ def _amo_lead(row_id: str) -> int | None:
     return int(v) if v.isdigit() else None
 
 
+def _amo_save_log() -> None:
+    sheets.set_state("amo_match_log", "\n".join(amo_crm.match_log))
+
+
+def _amo_taken() -> set:
+    """Сделки, уже привязанные к другим клиентам из таблицы, — их не берём для нового клиента."""
+    return {int(v[1]) for k, v in sheets._load_state().items() if k.startswith("amo_") and str(v[1]).isdigit()}
+
+
 def _amo_first_note(name: str, city: str, category: str, chat_id: str, client_text: str) -> str:
     return (f"Заявка с Avito\nКлиент: {name}, {city}\nКатегория: {category}\nЧат: {AVITO_CHAT_URL.format(chat_id)}"
             + (f"\n\nКлиент пишет:\n{client_text}" if client_text else ""))
@@ -1239,8 +1250,10 @@ def _amo_message(row_id: str, is_new: bool, name: str, city: str, category: str,
         lead = _amo_lead(row_id)
         if is_new and not lead:
             lead = amo_crm.create_lead(name, city, a.get("phone"),
-                                       _amo_first_note(name, city, category, chat_id, client_text))
+                                       _amo_first_note(name, city, category, chat_id, client_text),
+                                       client_text=client_text, taken=_amo_taken())
             sheets.set_state(f"amo_{row_id}", str(lead))
+            _amo_save_log()
         elif lead:
             amo_crm.note(lead, f"Клиент пишет в Avito:\n{client_text}")
         if not lead:
