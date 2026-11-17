@@ -36,6 +36,7 @@ HELP_TEXT = (
     "/status — работает ли бот, заявки и записи за сегодня, свободные окна\n"
     "/auto on | /auto off — отвечать клиентам самому (в понятных ситуациях) или только через вас\n"
     "/ai on | /ai off — отвечать по смыслу через DeepSeek или только по правилам\n"
+    "/amo on | /amo off — вести заявки сделками в amoCRM («Продажа курса») или нет\n"
     "/week — расписание на неделю (показать или задать: /week ср 14:00-16:00 пт 16-22 сб 11-22)\n"
     "/price около 1000 ₽ за час — что отвечать на вопрос о цене (/price без текста — не называть цену)\n"
     "/zoom https://… — ссылка Zoom для подтверждения записи\n"
@@ -52,7 +53,7 @@ MEMBER_HELP = (
     "Роман видит, что вы отправили клиентам. Настройки и доступы меняет только он."
 )
 # команды, которые меняют настройки бота, — только для Романа
-OWNER_ONLY = ("/auto", "/ai", "/week", "/zoom", "/price", "/team")
+OWNER_ONLY = ("/auto", "/ai", "/amo", "/week", "/zoom", "/price", "/team")
 
 # Статистика процесса для /status (в памяти, сбрасывается при перезапуске)
 _stats = {"started": "", "host": "", "last_check": 0.0, "check_secs": 0.0, "avito_fails": 0, "errors": []}
@@ -456,6 +457,10 @@ def _send_to_client(user_id: int, row_id: str, text: str, status: str) -> bool:
         _show_sent(row_id, v, text)
     finally:
         sheets.update_contact_status(row_id, status, new_draft=text)
+        lead = _amo_lead(row_id)
+        if lead:
+            who = "Бот ответил сам" if "бот сам" in status else "Ответ из Telegram"
+            _amo_safe("ответ клиенту", amo_crm.note, lead, f"{who} в Avito:\n{text}")
         if ZOOM_MARK in text:
             _log_trial_booking(row_id, v)
     return True
@@ -471,6 +476,17 @@ def _log_trial_booking(row_id: str, v: dict) -> None:
     sheets.log_booking(v["Имя"], meta.get("phone") or "—", v["chat_id"], when, v["Категория"])
     meta["book"] = ""
     sheets.set_state(f"meta_{row_id}", json.dumps(meta, ensure_ascii=False))
+
+    def amo_booked():
+        lead = _amo_lead(row_id)
+        if not lead:  # клиент писал до подключения amoCRM — запись на пробный всё равно заводим сделкой
+            lead = amo_crm.create_lead(v["Имя"], v["Город"], meta.get("phone"),
+                                       _amo_first_note(v["Имя"], v["Город"], v["Категория"], v["chat_id"], ""),
+                                       stage="booked")
+            sheets.set_state(f"amo_{row_id}", str(lead))
+        amo_crm.advance(lead, "booked")
+        amo_crm.note(lead, f"Записан на пробный урок: {when} (мск). Ссылка Zoom отправлена.")
+    _amo_safe("запись на пробный", amo_booked)
     tg.send_message(ADMIN_ID, f"📅 Записал на пробный: {v['Имя']} ({v['Город']}) — {when}"
                               + (f", тел. {meta['phone']}" if meta.get("phone") else "")
                               + "\nСтрока добавлена в лист «Записаны на пробный».")
@@ -544,6 +560,28 @@ def handle_callback(user_id: int, cq: dict) -> None:
         tg.answer_callback_query(cq["id"], "Не нашёл эту заявку")
         return
     v = contact["values"]
+
+    if action in ("trok", "trno"):  # «Пробный прошёл?» → amoCRM
+        lead = _amo_lead(row_id)
+        if not lead or not _amo_on():
+            tg.answer_callback_query(cq["id"], "amoCRM сейчас не подключён")
+            return
+        tg.answer_callback_query(cq["id"], "Отмечаю в amoCRM…")
+        if action == "trok":
+            ok = _amo_safe("пробный прошёл", lambda: (amo_crm.advance(lead, "trial_done"),
+                                                     amo_crm.note(lead, "Пробный урок проведён."))[0])
+            text = (f"✅ Пробный с {v['Имя']} проведён — в amoCRM «Проведен пробный урок»." if ok
+                    else f"⚠️ Не получилось отметить в amoCRM пробный с {v['Имя']} — подробности в /status.")
+        else:
+            ok = _amo_safe("не пришёл на пробный", lambda: (
+                amo_crm.note(lead, "Не пришёл на пробный урок."),
+                amo_crm.task(lead, f"{v['Имя']} не пришёл на пробный — связаться и перенести", hours=2), "ok")[2])
+            text = (f"🚫 {v['Имя']} не пришёл на пробный — поставил в amoCRM задачу связаться." if ok
+                    else f"⚠️ Не получилось отметить в amoCRM — подробности в /status.")
+        # не получилось — кнопки оставляем, можно нажать ещё раз
+        tg.edit_message_text(ADMIN_ID, message_id, text, {"inline_keyboard": []} if ok else tg.inline_keyboard(
+            [("✅ Прошёл", f"trok:{row_id}"), ("🚫 Не пришёл", f"trno:{row_id}")]))
+        return
 
     if action in ("send", "sv", "edit", "to", "now") and _is_sent(v):
         tg.answer_callback_query(cq["id"], "Этому клиенту уже отправлено ✅")
@@ -663,6 +701,15 @@ def status_text() -> str:
     else:
         lines.append(f"🧠 DeepSeek: {'включён' if _ai_enabled() else 'выключен (/ai on)'} · сегодня запросов {u['calls']}, "
                      f"не удалось {u['fails']}, токенов {u['tokens_in']}+{u['tokens_out']}")
+    s = amo_crm.stats
+    if not amo_crm.available():
+        lines.append("📇 amoCRM: не подключён (нет AMO_DOMAIN / AMO_TOKEN)")
+    elif not amo_crm.ready():
+        lines.append("📇 amoCRM: не веду сделки — " + sheets.get_state("amo_diag", "")[21:150])
+    else:
+        lines.append(f"📇 amoCRM: {'веду сделки' if _amo_on() else 'выключен (/amo on)'} · после запуска: создал "
+                     f"{s['created']}, перевёл {s['moved']}, задач {s['tasks']}, ошибок {s['errors']}"
+                     + (f"\n   последняя ошибка: {s['last_error']}" if s["last_error"] else ""))
     if ago is None:
         lines.append("Avito ещё не проверялся после запуска")
     else:
@@ -788,6 +835,18 @@ def handle_message(user_id: int, msg: dict) -> None:
             tg.send_message(ADMIN_ID, f"🧠 DeepSeek {'включён' if _ai_enabled() else 'выключен'}. Когда включён — "
                                       "отвечаю по смыслу переписки, а если модель не справилась — по правилам.\n"
                                       "/ai on — включить, /ai off — только правила.")
+        return
+
+    if text.startswith("/amo"):
+        arg = text[len("/amo"):].strip().lower()
+        if arg in ("on", "off"):
+            sheets.set_state("amo_mode", arg)
+        if not amo_crm.ready():
+            tg.send_message(ADMIN_ID, "📇 amoCRM не подключён: " + (sheets.get_state("amo_diag", "")[21:250] or "нет ключа"))
+        else:
+            tg.send_message(ADMIN_ID, f"📇 amoCRM {'включён' if _amo_on() else 'выключен'}. Когда включён — новые "
+                                      "заявки с Avito становятся сделками в «Продажа курса» и сами идут по этапам.\n"
+                                      "/amo on — включить, /amo off — выключить.")
         return
 
     if text.startswith("/auto"):
@@ -1133,6 +1192,93 @@ def _ai_enabled() -> bool:
     return sheets.get_state("ai_mode", "off") == "on" and ai_reply.available()
 
 
+# ---------- amoCRM (17.11): заявки → сделки в «Продажа курса», схема этапов — в amo_crm.py ----------
+
+AVITO_CHAT_URL = "https://www.avito.ru/profile/messenger/channel/{}"
+
+
+def _amo_on() -> bool:
+    return sheets.get_state("amo_mode", "on") == "on" and amo_crm.ready()
+
+
+def _amo_safe(what: str, fn, *args):
+    """amoCRM — дополнение: если он недоступен, заявки, ответы и записи работают как раньше."""
+    if not _amo_on():
+        return None
+    try:
+        return fn(*args)
+    except Exception as e:
+        amo_crm._fail(e)
+        _note_error(f"amoCRM ({what})", e)
+        print("ERROR amo:", what, str(e)[:300])
+        try:
+            sheets.set_state("amo_last_error", f"{_now()} {what}: {str(e)[:300]}")
+            if ("amoCRM 401" in str(e) or "amoCRM 402" in str(e)) and sheets.get_state("amo_alert_day", "") != today_str():
+                sheets.set_state("amo_alert_day", today_str())
+                tg.send_message(ADMIN_ID, "⚠️ amoCRM не пускает бота: " + ("токен не подходит или истёк — создайте новый "
+                                "и замените AMO_TOKEN" if "401" in str(e) else "аккаунт amoCRM не оплачен")
+                                + ". Заявки и ответы клиентам работают как обычно, только без amoCRM.")
+        except Exception:
+            pass
+        return None
+
+
+def _amo_lead(row_id: str) -> int | None:
+    v = sheets.get_state(f"amo_{row_id}", "")
+    return int(v) if v.isdigit() else None
+
+
+def _amo_first_note(name: str, city: str, category: str, chat_id: str, client_text: str) -> str:
+    return (f"Заявка с Avito\nКлиент: {name}, {city}\nКатегория: {category}\nЧат: {AVITO_CHAT_URL.format(chat_id)}"
+            + (f"\n\nКлиент пишет:\n{client_text}" if client_text else ""))
+
+
+def _amo_message(row_id: str, is_new: bool, name: str, city: str, category: str, chat_id: str, a: dict,
+                 client_text: str, manual_why: str) -> None:
+    def run():
+        lead = _amo_lead(row_id)
+        if is_new and not lead:
+            lead = amo_crm.create_lead(name, city, a.get("phone"),
+                                       _amo_first_note(name, city, category, chat_id, client_text))
+            sheets.set_state(f"amo_{row_id}", str(lead))
+        elif lead:
+            amo_crm.note(lead, f"Клиент пишет в Avito:\n{client_text}")
+        if not lead:
+            return  # клиент писал до подключения amoCRM — задним числом не заводим
+        if a.get("declined"):
+            if amo_crm.close_lost(lead) == "закрыл":
+                amo_crm.note(lead, "Бот закрыл сделку: клиент отказался (см. сообщение выше).")
+        elif a.get("category") in ("ЕГЭ", "ОГЭ") and (a.get("grade") or a.get("exam")) and a.get("has_our_msgs"):
+            amo_crm.advance(lead, "qualified")
+        # если Роман сам переписывается с клиентом, задача «ответить» ему не нужна
+        if manual_why and "сами ведёте" not in manual_why and sheets.get_state(f"amo_task_{row_id}", "") != today_str():
+            amo_crm.task(lead, f"Ответить клиенту {name} в Avito: {manual_why}"[:900], hours=1)
+            sheets.set_state(f"amo_task_{row_id}", today_str())
+    _amo_safe("заявка", run)
+
+
+def _amo_trial_followups() -> None:
+    """Через 35 минут после начала пробного спрашиваем Романа, прошёл ли он, — отмечаем в amoCRM."""
+    if not _amo_on():
+        return
+    now = datetime.now(MSK)
+    for b in sheets.get_bookings():
+        when = (b.get("Когда пробный урок") or "").strip()
+        try:
+            dt = datetime.strptime(when, "%d.%m.%Y %H:%M").replace(tzinfo=MSK)
+        except ValueError:
+            continue
+        if not timedelta(minutes=35) <= now - dt <= timedelta(days=2):
+            continue
+        c = sheets.find_contact_by_chat((b.get("chat_id") or "").strip())
+        row_id = c["values"]["id"] if c else ""
+        if not row_id or not _amo_lead(row_id) or sheets.get_state(f"amo_trial_{row_id}", "") == when:
+            continue
+        sheets.set_state(f"amo_trial_{row_id}", when)
+        tg.send_message(ADMIN_ID, f"🎓 Пробный с {b.get('Имя', '')} {when} — прошёл?\nОтмечу в amoCRM.",
+                        tg.inline_keyboard([("✅ Прошёл", f"trok:{row_id}"), ("🚫 Не пришёл", f"trno:{row_id}")]))
+
+
 def _hard_manual_reason(a: dict) -> str:
     """Где отвечает только Роман — и модель, и правила: урок идёт, реклама, задачи/жалобы, звонок, после записи."""
     if a.get("call_request"):
@@ -1223,6 +1369,9 @@ def _notify_client(user_id: int, chat_id: str, name: str, city: str, avito_msg_i
     sheets.set_state(f"card_{sent.get('message_id')}", row_id)
     sheets.set_state(f"vardate_{row_id}", today_str())
     _save_meta(row_id, a)
+    # amoCRM — до автоответа, чтобы ответ бота тоже лёг в сделку примечанием
+    _amo_message(row_id, not (existing and existing["values"]["id"]), name, city, category, chat_id, a, client_text,
+                 why if (allow_auto and _auto_enabled() and not auto_ok) else "")
     if auto_ok and not AUTO_DELAY and row_id in _pending_auto:
         # отвечаем сразу — уже после того, как заявка и время записи сохранены в таблицу
         _send_auto(user_id, row_id, _pending_auto[row_id])
@@ -1284,6 +1433,10 @@ def _run_avito_check(user_id: int) -> None:
     try:
         maybe_ask_daily_slots()
         check_new_avito_messages(user_id)
+        try:
+            _amo_trial_followups()
+        except Exception as e:
+            _note_error("amoCRM (пробные)", e)
     except Exception as e:
         print("ERROR avito check:", traceback.format_exc())
         _note_error("проверка Avito", e)
