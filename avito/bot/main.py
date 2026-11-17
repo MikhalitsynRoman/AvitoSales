@@ -1023,7 +1023,9 @@ def check_new_avito_messages(user_id: int) -> None:
     for chat in chats:
         last = chat.get("last_message") or {}
         if last.get("direction") != "in":
-            _mark_answered_in_avito(chat["id"])
+            # наше напоминание о пробном — это не ответ на вопрос клиента: заявку «ожидает» не гасим
+            if not _is_reminder((last.get("content") or {}).get("text", "")):
+                _mark_answered_in_avito(chat["id"])
             continue
         avito_msg_id = last.get("id", "")
         if not avito_msg_id or avito_msg_id in seen_ids:
@@ -1064,6 +1066,97 @@ def check_new_avito_messages(user_id: int) -> None:
 
     if not bootstrapped:
         sheets.set_state("bootstrapped", "1")
+
+
+# ---------- напоминания о пробном (17.11, по просьбе Романа) ----------
+# По листу «Записаны на пробный»: за 3 часа и за 30 минут до начала бот сам пишет клиенту в Avito.
+# Окно: «за 3 часа» — пока до урока от 3 ч до 2 ч, «за 30 минут» — от 30 до 10 мин (если бот был выключен
+# и окно прошло, поздно не напоминаем). Только что записавшемуся (меньше часа / 15 мин назад) не пишем —
+# подтверждение со ссылкой и так перед глазами. Если после записи в чате звучала отмена или перенос — не пишем,
+# а говорим Роману.
+REMINDERS = (("3h", timedelta(hours=3), timedelta(hours=2), timedelta(hours=1)),
+             ("30m", timedelta(minutes=30), timedelta(minutes=10), timedelta(minutes=15)))
+REMINDER_MARKS = ("Напоминаю, что", "начинаем пробное занятие")
+CANCEL_RE = re.compile(r"отмен|перенес|перенос|не\s+смож|не\s+получ|не\s+успева|не\s+прид|не\s+будем|"
+                       r"заболе|боле(ет|ю|ла|л)\b|температур|передума", re.I)
+_reminded = set()  # ключи уже отправленных напоминаний в этом процессе (и в «Состоянии» — между процессами)
+
+
+def _is_reminder(text: str) -> bool:
+    return any(m in (text or "") for m in REMINDER_MARKS)
+
+
+def _reminder_text(kind: str, name: str, dt: datetime, now: datetime) -> str:
+    first = name.split()[0] if name and name.strip() not in ("", "—") else ""
+    day = "сегодня" if dt.date() == now.date() else "завтра" if dt.date() == now.date() + timedelta(days=1) \
+        else dt.strftime("%d.%m")
+    if kind == "3h":
+        h = now.hour
+        word = "доброе утро" if 5 <= h < 12 else "добрый день" if 12 <= h < 18 else "добрый вечер"
+        hello = f"{first}, {word}!" if first else f"{word.capitalize()}!"
+        return (f"{hello} Напоминаю, что {day} в {dt:%H:%M} мск у нас пробное занятие по математике в Zoom 🙂\n"
+                "За 30 минут до начала пришлю ссылку ещё раз.")
+    zoom = sheets.get_state("zoom_link", "")
+    return (f"{first + ', ' if first else ''}через 30 минут, в {dt:%H:%M} мск, начинаем пробное занятие 🙂\n"
+            + (f"Ссылка для подключения:\n{zoom}\n\n" if zoom else "Ссылка для подключения — в сообщении выше.\n\n")
+            + "До встречи!")
+
+
+def _parse_msk(value: str) -> datetime | None:
+    try:
+        return datetime.strptime((value or "").strip(), "%d.%m.%Y %H:%M").replace(tzinfo=MSK)
+    except ValueError:
+        return None
+
+
+def _trial_reminders(user_id: int) -> None:
+    now = datetime.now(MSK)
+    latest = {}  # chat_id -> (когда урок, когда записали, строка): напоминаем только о последней записи клиента
+    for b in sheets.get_bookings():
+        chat = (b.get("chat_id") or "").strip()
+        dt = _parse_msk(b.get("Когда пробный урок", ""))
+        if not chat or chat == "—" or not dt:
+            continue
+        made = _parse_msk(b.get("Дата и время", "")) or dt - timedelta(days=1)
+        if chat not in latest or made >= latest[chat][1]:
+            latest[chat] = (dt, made, b)
+    for chat, (dt, made, b) in latest.items():
+        for kind, before, until, fresh in REMINDERS:
+            left = dt - now
+            if not until <= left <= before or now - made < fresh:
+                continue
+            key = f"rem{kind}_{chat}_{dt:%d%m%H%M}"
+            if key in _reminded or sheets.get_state(key, ""):
+                continue
+            _reminded.add(key)
+            name = b.get("Имя", "")
+            dialog = _load_dialog(user_id, chat)
+            after = [m for m in dialog if m["created"] > made.timestamp() + 60 and not _is_reminder(m["text"])]
+            cancel = next((m["text"] for m in after if CANCEL_RE.search(m["text"]) or
+                           (m["direction"] == "in" and analyze_dialog([m])["declined"])), "")
+            if cancel:
+                for k2 in (k for k, *_ in REMINDERS):  # ни одного напоминания по этой записи, предупреждение одно
+                    _reminded.add(f"rem{k2}_{chat}_{dt:%d%m%H%M}")
+                    sheets.set_state(f"rem{k2}_{chat}_{dt:%d%m%H%M}", f"не отправлено: {_now()}")
+                tg.send_message(ADMIN_ID, f"⏸ Не напомнил {name} о пробном {dt:%d.%m в %H:%M}: после записи в чате было "
+                                          f"«{cancel[:200]}». Проверьте, в силе ли пробный, — если перенесли, "
+                                          "поменяйте время в листе «Записаны на пробный».")
+                continue
+            text = _reminder_text(kind, name, dt, now)
+            try:
+                avito_client.send_message(user_id, chat, text)
+            except Exception as e:
+                _reminded.discard(key)  # не ушло — попробуем при следующей проверке, пока окно не прошло
+                _note_error("напоминание о пробном", e)
+                continue
+            sheets.set_state(key, _now())
+            when = f"{'сегодня' if dt.date() == now.date() else dt.strftime('%d.%m')} в {dt:%H:%M}"
+            tg.send_message(ADMIN_ID, f"🔔 Напомнил {name} о пробном {when} "
+                                      f"({'за 3 часа' if kind == '3h' else 'за 30 минут, со ссылкой Zoom'}).")
+            c = sheets.find_contact_by_chat(chat)
+            lead = _amo_lead(c["values"]["id"]) if c else None
+            if lead:
+                _amo_safe("напоминание", amo_crm.note, lead, f"Бот напомнил о пробном ({kind}):\n{text}")
 
 
 def _mark_answered_in_avito(chat_id: str) -> None:
@@ -1446,6 +1539,10 @@ def _run_avito_check(user_id: int) -> None:
     try:
         maybe_ask_daily_slots()
         check_new_avito_messages(user_id)
+        try:
+            _trial_reminders(user_id)
+        except Exception as e:
+            _note_error("напоминания о пробном", e)
         try:
             _amo_trial_followups()
         except Exception as e:

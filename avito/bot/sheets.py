@@ -1,6 +1,6 @@
 import re
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 import gspread
 from google.oauth2.service_account import Credentials
@@ -325,7 +325,8 @@ def get_bookings() -> list[dict]:
 def log_booking(name: str, phone: str, chat_id: str, when: str, goal: str) -> None:
     """when — «05.11.2026 16:30»: по нему бот понимает, что это окно занято."""
     bookings = get_bookings()
-    row = [datetime.now().strftime("%d.%m.%Y %H:%M"), name or "—", phone or "—", chat_id, when or "—", goal or "—"]
+    msk = datetime.now(timezone(timedelta(hours=3)))  # время записи по Москве: по нему считаются напоминания
+    row = [msk.strftime("%d.%m.%Y %H:%M"), name or "—", phone or "—", chat_id, when or "—", goal or "—"]
     data = dict(zip(BOOKINGS_HEADERS, row))
     _append(_get_or_create_sheet(_spreadsheet(), BOOKINGS_SHEET, BOOKINGS_HEADERS, any_order=True),
             [data.get(h, "") for h in _bookings_head])
