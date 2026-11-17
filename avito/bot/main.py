@@ -1363,6 +1363,47 @@ def _amo_message(row_id: str, is_new: bool, name: str, city: str, category: str,
     _amo_safe("заявка", run)
 
 
+AMO_SYNC_VERSION = "bookings-v1"
+
+
+def amo_sync_bookings_once() -> None:
+    """17.11: Роман спросил, почему Анастасии (записана 16.11, до подключения amoCRM) нет на «Назначен пробный урок».
+    Один раз переносим в amoCRM всех, у кого пробный сегодня или позже: находим их сделку (канал Avito / принятая /
+    по телефону) или создаём, ставим на «Назначен пробный урок»."""
+    if not _amo_on() or sheets.get_state("amo_synced", "") == AMO_SYNC_VERSION:
+        return
+    sheets.set_state("amo_synced", AMO_SYNC_VERSION)
+    now = datetime.now(MSK)
+    latest = {}
+    for b in sheets.get_bookings():
+        chat, dt = (b.get("chat_id") or "").strip(), _parse_msk(b.get("Когда пробный урок", ""))
+        made = _parse_msk(b.get("Дата и время", "")) or now
+        if chat and chat != "—" and dt and dt >= now - timedelta(hours=2) and (chat not in latest or made >= latest[chat][1]):
+            latest[chat] = (dt, made, b)
+    report = []
+    for chat, (dt, _, b) in sorted(latest.items(), key=lambda x: x[1][0]):
+        c = sheets.find_contact_by_chat(chat)
+        if not c or _amo_lead(c["values"]["id"]):
+            continue
+        v, when = c["values"], b["Когда пробный урок"]
+        phone = b.get("Телефон", "") if any(ch.isdigit() for ch in b.get("Телефон", "")) else None
+
+        def run():
+            lead = amo_crm.create_lead(v["Имя"], v["Город"], phone,
+                                       _amo_first_note(v["Имя"], v["Город"], v["Категория"], chat, ""),
+                                       stage="booked", client_text=v.get("Сообщение клиента", ""), taken=_amo_taken())
+            sheets.set_state(f"amo_{v['id']}", str(lead))
+            amo_crm.advance(lead, "booked")
+            amo_crm.note(lead, f"Записан на пробный урок: {when} (мск). Ссылка Zoom отправлена.")
+            return amo_crm.match_log[-1].split(": ", 1)[-1] if amo_crm.match_log else f"сделка #{lead}"
+        res = _amo_safe("перенос записанных", run)
+        report.append(f"• {v['Имя']} — пробный {when}: " + (res or "не получилось, см. /status"))
+    _amo_save_log()
+    if report:
+        tg.send_message(ADMIN_ID, "📇 Перенёс в amoCRM уже записанных на пробный (они записались до подключения "
+                                  "amoCRM), этап «Назначен пробный урок»:\n" + "\n".join(report))
+
+
 def _amo_trial_followups() -> None:
     """Через 35 минут после начала пробного спрашиваем Романа, прошёл ли он, — отмечаем в amoCRM."""
     if not _amo_on():
@@ -1544,6 +1585,7 @@ def _run_avito_check(user_id: int) -> None:
         except Exception as e:
             _note_error("напоминания о пробном", e)
         try:
+            amo_sync_bookings_once()
             _amo_trial_followups()
         except Exception as e:
             _note_error("amoCRM (пробные)", e)
