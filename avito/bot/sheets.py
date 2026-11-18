@@ -13,6 +13,7 @@ from config import CREDENTIALS_FILE, SPREADSHEET_ID
 # Повторять записи безопасно: бот пишет в конкретные ячейки (а _append ещё и проверяет, что строка пуста).
 import time  # noqa: E402
 
+import google.auth.exceptions  # noqa: E402
 import requests  # noqa: E402
 
 RETRY_DELAYS = [1, 3, 7, 15]
@@ -30,7 +31,8 @@ def _with_retries(orig):
                 if code not in RETRY_CODES or delay is None:
                     raise
                 why = f"Google {code}"
-            except (requests.ConnectionError, requests.Timeout) as e:
+            # TransportError — обрыв при получении токена доступа Google (oauth2.googleapis.com), 18.11 на ноутбуке
+            except (requests.ConnectionError, requests.Timeout, google.auth.exceptions.TransportError) as e:
                 if delay is None:
                     raise
                 why = type(e).__name__
