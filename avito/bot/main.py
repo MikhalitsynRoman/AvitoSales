@@ -1518,6 +1518,44 @@ def amo_sync_bookings_once() -> None:
 _user_id_for_amo = 0  # id аккаунта Avito — main() подставляет при старте (нужен, чтобы читать переписку)
 
 
+AMO_FIELDS_VERSION = "cleanup-v1"
+
+
+def amo_fields_once(user_id: int) -> None:
+    """19.11, по «удали все 14» Романа: один раз удаляем лишние поля сделки и заполняем «Класс», «Экзамен»,
+    «Комментарий», «Бюджет» у сделок, которые бот уже ведёт. Итог — Роману в Telegram."""
+    if not _amo_on() or sheets.get_state("amo_fields_done", "") == AMO_FIELDS_VERSION:
+        return
+    sheets.set_state("amo_fields_done", AMO_FIELDS_VERSION)
+    deleted = _amo_safe("удаление полей", amo_crm.delete_fields) or ["не получилось — подробности в /status"]
+    filled = []
+    for key, (_, value) in list(sheets._load_state().items()):
+        if not (key.startswith("amo_") and str(value).isdigit()):
+            continue
+        row_id = key[len("amo_"):]
+        c = sheets.get_contact_by_id(row_id)
+        if not c:
+            continue
+        v = c["values"]
+        dialog = _load_dialog(user_id, v["chat_id"])
+        if not dialog:
+            continue
+        a = analyze_dialog(dialog)
+        booked = next((norm_when(b.get("Когда пробный урок", "")) for b in reversed(sheets.get_bookings())
+                       if (b.get("chat_id") or "").strip() == v["chat_id"]), "")
+        comment = _amo_comment(v["Город"], a) + (f" · пробный {booked}" if booked else "")
+        exam = a.get("category") if a.get("category") in ("ЕГЭ", "ОГЭ") else None
+        done = _amo_safe("заполнение полей", amo_crm.fill_fields, int(value), a.get("grade"), exam, comment,
+                         _amo_written(row_id))
+        if done:
+            _amo_save_written(row_id, done)
+            filled.append(f"• {v['Имя']}: " + ", ".join(f"{k} {x}" for k, x in done.items() if k != "Комментарий"))
+    sheets.set_state("amo_fields_report", f"{_now()}\n" + amo_crm.fields_report())
+    tg.send_message(ADMIN_ID, "📇 amoCRM, поля сделки:\n" + "\n".join(deleted)
+                    + "\n\nЗаполнил «Класс», «Экзамен», «Комментарий», «Бюджет» у сделок, которые веду:\n"
+                    + ("\n".join(filled) or "• пока нечего заполнять"))
+
+
 def _amo_trial_followups() -> None:
     """Через 35 минут после начала пробного спрашиваем Романа, прошёл ли он, — отмечаем в amoCRM."""
     if not _amo_on():
@@ -1697,6 +1735,7 @@ def _run_avito_check(user_id: int) -> None:
             _note_error("напоминания о пробном", e)
         try:
             amo_sync_bookings_once()
+            amo_fields_once(user_id)
             _amo_trial_followups()
         except Exception as e:
             _note_error("amoCRM (пробные)", e)

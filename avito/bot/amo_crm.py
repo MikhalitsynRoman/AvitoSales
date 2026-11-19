@@ -310,6 +310,37 @@ def fill_fields(lead_id: int, grade: str | None, exam: str | None, comment: str,
     return done
 
 
+# 19.11 Роман: «удали все 14» — из боковой панели сделки остаются только «Класс», «Экзамен», «Комментарий» (+ «Бюджет»).
+# id и названия — из отчёта amo_fields_report того же дня; удаляем, только если название по id совпадает.
+FIELDS_TO_DELETE = {
+    2173505: "Название курса", 2173507: "Преподаватель", 2173509: "Дата начала обучения",
+    2173511: "Дата и время начала вебинара", 2173513: "Группа", 2173515: "Тип оплаты", 2173517: "Причина отказа",
+    2173677: "Avito chat id (Radist.online)", 2173679: "Avito chat url (Radist.online)",
+    2173681: "Avito item price (Radist.online)", 2173683: "Avito item name (Radist.online)",
+    2173685: "Avito item url (Radist.online)", 2173691: "Объявление", 2173693: "URL объявления",
+}
+
+
+def delete_fields() -> list[str]:
+    """Удаляет поля из FIELDS_TO_DELETE (данные в них пропадают во всех сделках). Возвращает строки отчёта."""
+    have = {f["id"]: f for f in lead_fields()}
+    out = []
+    for fid, name in FIELDS_TO_DELETE.items():
+        f = have.get(fid)
+        if not f:
+            out.append(f"«{name}» — уже нет")
+            continue
+        if f.get("name", "").strip() != name:
+            out.append(f"«{name}» — НЕ удалил: под этим номером теперь поле «{f.get('name')}»")
+            continue
+        try:
+            _req("DELETE", f"leads/custom_fields/{fid}")
+            out.append(f"«{name}» — удалил")
+        except Exception as e:
+            out.append(f"«{name}» — не удалось: {str(e)[:120]}")
+    return out
+
+
 def fields_report() -> str:
     """Только чтение: какие поля есть в карточке сделки и в скольких из последних 250 сделок они заполнены."""
     fs = lead_fields()
