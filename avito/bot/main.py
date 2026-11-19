@@ -487,28 +487,32 @@ def _log_trial_booking(row_id: str, v: dict) -> None:
     meta["book"] = ""
     sheets.set_state(f"meta_{row_id}", json.dumps(meta, ensure_ascii=False))
 
-    def amo_booked():
-        lead = _amo_lead(row_id)
-        if not lead:
-            lead = amo_crm.find_lead(v["Имя"], meta.get("phone"),
-                                     _amo_first_note(v["Имя"], v["Город"], v["Категория"], v["chat_id"], ""),
-                                     stage="booked", client_text=v.get("Сообщение клиента", ""), taken=_amo_taken())
-            _amo_save_log()
-            if not lead:
-                tg.send_message(ADMIN_ID, f"📇 Не нашёл в amoCRM сделку {v['Имя']} от интеграции Avito — этап "
-                                          "«Назначен пробный урок» не поставил. Если сделка есть, поставьте его вручную.")
-                return
-            sheets.set_state(f"amo_{row_id}", str(lead))
-        amo_crm.advance(lead, "booked")
-        amo_crm.note(lead, f"Записан на пробный урок: {when} (мск). Ссылка Zoom отправлена.")
-        written = _amo_written(row_id)
-        base = written.get("Комментарий", "").split(" · пробный ")[0]
-        _amo_save_written(row_id, amo_crm.fill_fields(lead, None, None, (base + " · " if base else "")
-                                                      + f"пробный {when}", written))
-    _amo_safe("запись на пробный", amo_booked)
+    _amo_safe("запись на пробный", _amo_set_booked, row_id, v, meta.get("phone"), when, "Ссылка Zoom отправлена.")
     tg.send_message(ADMIN_ID, f"📅 Записал на пробный: {v['Имя']} ({v['Город']}) — {when}"
                               + (f", тел. {meta['phone']}" if meta.get("phone") else "")
                               + "\nСтрока добавлена в лист «Записаны на пробный».")
+
+
+def _amo_set_booked(row_id: str, v: dict, phone: str | None, when: str, how: str) -> int:
+    """Сделка клиента (строка «Обращений» row_id) → «Назначен пробный урок», заметка и «· пробный …» в комментарии.
+    Сделку не создаём: её заводит интеграция Avito ↔ amoCRM; не нашли — одно сообщение Роману."""
+    lead = _amo_lead(row_id)
+    if not lead:
+        lead = amo_crm.find_lead(v["Имя"], phone, _amo_first_note(v["Имя"], v["Город"], v["Категория"], v["chat_id"], ""),
+                                 stage="booked", client_text=v.get("Сообщение клиента", ""), taken=_amo_taken())
+        _amo_save_log()
+        if not lead:
+            tg.send_message(ADMIN_ID, f"📇 Не нашёл в amoCRM сделку {v['Имя']} от интеграции Avito — этап "
+                                      "«Назначен пробный урок» не поставил. Если сделка есть, поставьте его вручную.")
+            return 0
+        sheets.set_state(f"amo_{row_id}", str(lead))
+    amo_crm.advance(lead, "booked")
+    amo_crm.note(lead, f"Записан на пробный урок: {when} (мск). {how}")
+    written = _amo_written(row_id)
+    base = written.get("Комментарий", "").split(" · пробный ")[0]
+    _amo_save_written(row_id, amo_crm.fill_fields(lead, None, None, (base + " · " if base else "")
+                                                  + f"пробный {when}", written))
+    return lead
 
 
 def _show_sent(row_id: str, v: dict, text: str) -> None:
@@ -1130,6 +1134,7 @@ def _parse_msk(value: str) -> datetime | None:
 
 
 _chat_guess = {}  # (имя, когда) -> chat_id или "" (не понял)
+_chat_miss = {}  # (имя, когда) -> когда подбор без уведомления не нашёл клиента (повторим через 30 минут)
 
 
 def _booking_chat(user_id: int, b: dict, dt: datetime, notify: bool = True) -> str:
@@ -1145,6 +1150,8 @@ def _booking_chat(user_id: int, b: dict, dt: datetime, notify: bool = True) -> s
         return ""
     if key in _chat_guess:
         return _chat_guess[key]
+    if not notify and time.time() - _chat_miss.get(key, 0) < 1800:
+        return ""
     st_key = f"bchat_{dt:%d%m%H%M}_{name.replace(' ', '_')[:30]}"
     saved = sheets.get_state(st_key, "")
     if saved:
@@ -1169,9 +1176,12 @@ def _booking_chat(user_id: int, b: dict, dt: datetime, notify: bool = True) -> s
                 with_time.append(c)
     pick = with_link if len(with_link) == 1 else with_time if len(with_time) == 1 else []
     chat = pick[0]["chat_id"] if pick else ""
+    if not chat and not notify:
+        _chat_miss[key] = time.time()
+        return ""
     sheets.set_state(st_key, chat or "?")
     _chat_guess[key] = chat
-    if not chat and notify:
+    if not chat:
         who = ", ".join(f"{c['Имя']} ({c['Город']})" for c in (with_link or cands)[:4]) or "никого с таким именем"
         tg.send_message(ADMIN_ID, f"🔔 Не смогу напомнить «{b.get('Имя', '')}» о пробном {dt:%d.%m в %H:%M}: в листе "
                                   f"«Записаны на пробный» у этой строки нет chat_id, а по имени не понял, кто это "
@@ -1515,6 +1525,39 @@ def amo_sync_bookings_once() -> None:
                                   "amoCRM), этап «Назначен пробный урок»:\n" + "\n".join(report))
 
 
+def amo_manual_bookings(user_id: int) -> None:
+    """19.11, «Да, сделай»: запись, которую Роман внёс в «Записаны на пробный» руками (без chat_id), тоже ставит сделку
+    на «Назначен пробный урок». Клиента узнаём по имени, как для напоминаний; по каждой записи — один раз."""
+    if not _amo_on():
+        return
+    now = datetime.now(MSK)
+    for b in sheets.get_bookings():
+        if (b.get("chat_id") or "").strip() not in ("", "—"):
+            continue  # запись сделал бот — сделку он уже передвинул
+        when = norm_when(b.get("Когда пробный урок") or "")
+        dt = _parse_msk(when)
+        if not dt or not -timedelta(hours=2) <= dt - now <= timedelta(days=14):
+            continue
+        name = re.sub(r"\s+", "_", (b.get("Имя") or "").strip().lower())[:30]
+        done_key = f"amob_{dt:%d%m%H%M}_{name}"
+        if not name or sheets.get_state(done_key, ""):
+            continue
+        chat = _booking_chat(user_id, b, dt, notify=False)
+        c = sheets.find_contact_by_chat(chat) if chat else None
+        if not c:
+            continue  # ещё не узнали клиента — попробуем позже (за 3 часа до урока бот сам напишет, если не узнает)
+        v = c["values"]
+        phone = b.get("Телефон", "") if any(ch.isdigit() for ch in b.get("Телефон", "")) else None
+        lead = _amo_safe("запись вручную", _amo_set_booked, v["id"], v, phone, when,
+                         "Запись внесена вручную в лист «Записаны на пробный».")
+        if lead is None:
+            continue  # amoCRM недоступен или ошибка — повторим при следующей проверке
+        sheets.set_state(done_key, f"{_now()} " + (f"#{lead}" if lead else "сделку не нашёл"))
+        if lead:
+            tg.send_message(ADMIN_ID, f"📇 {v['Имя']} ({v['Город']}): запись на пробный {when} из таблицы — "
+                                      "сделку в amoCRM поставил на «Назначен пробный урок».")
+
+
 _user_id_for_amo = 0  # id аккаунта Avito — main() подставляет при старте (нужен, чтобы читать переписку)
 
 
@@ -1736,6 +1779,7 @@ def _run_avito_check(user_id: int) -> None:
         try:
             amo_sync_bookings_once()
             amo_fields_once(user_id)
+            amo_manual_bookings(user_id)
             _amo_trial_followups()
         except Exception as e:
             _note_error("amoCRM (пробные)", e)
