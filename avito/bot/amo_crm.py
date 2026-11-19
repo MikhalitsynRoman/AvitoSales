@@ -197,32 +197,131 @@ def _channel_lead(name: str, client_text: str, taken: set) -> tuple[int | None, 
     return None, ""
 
 
-def create_lead(name: str, city: str, phone: str | None, first_note: str, stage: str = "new",
-                client_text: str = "", taken: set = frozenset()) -> int:
-    """Сделка в «Продажа курса» с контактом. Сначала ищем, нет ли уже этого клиента: по телефону, в «Неразобранном»
-    от канала Avito, среди принятых сделок — и только если нет, создаём свою."""
-    lead_id, contact_id = _open_lead_by_phone(phone) if phone else (None, None)
+def find_lead(name: str, phone: str | None, first_note: str, stage: str = "new",
+              client_text: str = "", taken: set = frozenset()) -> int | None:
+    """Сделку создаёт интеграция Avito ↔ amoCRM (19.11 Роман: «пусть заявки идут напрямую через интеграцию, а ты
+    находи их и двигай»). Бот только ищет её: по телефону, в «Неразобранном» (принимает), среди принятых сделок.
+    Не нашёл — None: попробуем при следующем сообщении клиента (сделка интеграции могла ещё не появиться)."""
+    lead_id, _ = _open_lead_by_phone(phone) if phone else (None, None)
     if lead_id and lead_id not in taken:
         _log_match(f"«{name}»: нашёл открытую сделку #{lead_id} по телефону")
     else:
         lead_id = _channel_lead(name, client_text, taken)[0]
-    if lead_id:
-        note(lead_id, first_note)
-        advance(lead_id, stage)
-        return lead_id
-    contact = {"id": contact_id} if contact_id else {"first_name": name or "Клиент Avito"}
-    if phone and not contact_id:
-        contact["custom_fields_values"] = [{"field_code": "PHONE", "values": [{"value": phone, "enum_code": "WORK"}]}]
-    title = f"{name or 'Клиент'} — Avito" + (f" ({city})" if city and city != "—" else "")
-    res = _req("POST", "leads/complex", body=[{
-        "name": title[:250], "pipeline_id": _pipe["id"], "status_id": _pipe["stage"][stage],
-        "_embedded": {"contacts": [contact], "tags": [{"name": TAG}]},
-    }])
-    lead_id = res[0]["id"]
-    stats["created"] += 1
-    _log_match(f"«{name}»: в amoCRM его нет — создал сделку #{lead_id}")
+    if not lead_id:
+        _log_match(f"«{name}»: сделки от интеграции Avito пока нет — свою не создаю, поищу при следующем сообщении")
+        return None
+    stats["created"] += 1  # в /status: «нашёл сделок»
     note(lead_id, first_note)
+    advance(lead_id, stage)
     return lead_id
+
+
+# ---------- поля сделки: «Класс», «Экзамен», «Комментарий» + «Бюджет» (19.11, по просьбе Романа) ----------
+# Бюджет: ЕГЭ 11 класс — 12000, ЕГЭ 10 класс — 6000, ОГЭ 9 класс — 12000 (остальное не ставим).
+FIELD_DEFS = {
+    "Класс": {"type": "select", "enums": [str(g) for g in range(5, 12)]},
+    "Экзамен": {"type": "select", "enums": ["ЕГЭ", "ОГЭ"]},
+    "Комментарий": {"type": "textarea"},
+}
+BUDGET = {("ЕГЭ", "11"): 12000, ("ЕГЭ", "10"): 6000, ("ОГЭ", "9"): 12000}
+_fields = {}  # название → {"id", "type", "enums": {значение: enum_id}}
+
+
+def lead_fields() -> list[dict]:
+    out, page = [], 1
+    while True:
+        data = _get("leads/custom_fields", {"page": page, "limit": 50})
+        out += (data.get("_embedded") or {}).get("custom_fields", [])
+        if not (data.get("_links") or {}).get("next"):
+            return out
+        page += 1
+
+
+def ensure_fields() -> str:
+    """Находит поля «Класс», «Экзамен», «Комментарий»; каких нет — создаёт (существующие не трогает)."""
+    _fields.clear()
+    have = {f["name"].strip().lower(): f for f in lead_fields()}
+    made = []
+    for name, d in FIELD_DEFS.items():
+        f = have.get(name.lower())
+        if not f:
+            body = {"name": name, "type": d["type"]}
+            if d.get("enums"):
+                body["enums"] = [{"value": v, "sort": i + 1} for i, v in enumerate(d["enums"])]
+            res = _req("POST", "leads/custom_fields", body=[body])
+            f = ((res or {}).get("_embedded") or {}).get("custom_fields", [{}])[0]
+            made.append(name)
+        enums = {e["value"]: e["id"] for e in (f.get("enums") or [])}
+        if d.get("enums") and f.get("id"):  # в списке не хватает значения (например, «8» в «Класс») — добавляем
+            missing = [v for v in d["enums"] if v not in enums]
+            if missing:
+                all_enums = [{"id": i, "value": v} for v, i in enums.items()] + [{"value": v} for v in missing]
+                res = _req("PATCH", f"leads/custom_fields/{f['id']}", body={"enums": all_enums})
+                enums = {e["value"]: e["id"] for e in (res or {}).get("enums") or []} or enums
+        _fields[name] = {"id": f.get("id"), "type": f.get("type", d["type"]), "enums": enums}
+    return ("создал поля: " + ", ".join(made)) if made else "поля на месте"
+
+
+def _current_values(lead: dict) -> dict:
+    by_id = {f["id"]: n for n, f in _fields.items()}
+    out = {}
+    for cf in lead.get("custom_fields_values") or []:
+        n = by_id.get(cf.get("field_id"))
+        if n:
+            out[n] = str(((cf.get("values") or [{}])[0]).get("value", ""))
+    out["Бюджет"] = str(lead.get("price") or "")
+    return out
+
+
+def fill_fields(lead_id: int, grade: str | None, exam: str | None, comment: str, written: dict) -> dict:
+    """Заполняет Класс/Экзамен/Комментарий/Бюджет. Поле, которое Роман поправил руками (значение не пустое и не то,
+    что бот писал раньше), не трогаем. Возвращает, что записано, — main хранит это в state amo_f_{row}."""
+    if not _fields:
+        return written
+    want = {}
+    if grade and grade in (_fields.get("Класс") or {}).get("enums", {}):
+        want["Класс"] = grade
+    if exam in ("ЕГЭ", "ОГЭ"):
+        want["Экзамен"] = exam
+    if comment:
+        want["Комментарий"] = comment[:1000]
+    budget = BUDGET.get((exam, grade))
+    if budget:
+        want["Бюджет"] = str(budget)
+    if not want:
+        return written
+    cur = _current_values(_get(f"leads/{lead_id}"))
+    body, cfs, done = {}, [], dict(written)
+    for name, value in want.items():
+        now = cur.get(name, "")
+        if now == value or (now and now != written.get(name)):
+            continue  # уже так или поправлено руками
+        if name == "Бюджет":
+            body["price"] = int(value)
+        else:
+            f = _fields[name]
+            val = {"enum_id": f["enums"][value]} if f["type"] == "select" else {"value": value}
+            cfs.append({"field_id": f["id"], "values": [val]})
+        done[name] = value
+    if cfs:
+        body["custom_fields_values"] = cfs
+    if body:
+        _req("PATCH", f"leads/{lead_id}", body=body)
+    return done
+
+
+def fields_report() -> str:
+    """Только чтение: какие поля есть в карточке сделки и в скольких из последних 250 сделок они заполнены."""
+    fs = lead_fields()
+    data = _get("leads", {"limit": 250, "order[created_at]": "desc"})
+    filled = {}
+    for lead in (data.get("_embedded") or {}).get("leads", []):
+        for cf in lead.get("custom_fields_values") or []:
+            filled[cf["field_id"]] = filled.get(cf["field_id"], 0) + 1
+    lines = [f"#{f['id']} «{f['name']}» · {f.get('type')} · {'системное' if not f.get('is_deletable', True) else 'можно удалить'}"
+             f"{' · только API' if f.get('is_api_only') else ''} · заполнено в {filled.get(f['id'], 0)} из последних сделок"
+             for f in fs]
+    return "\n".join(lines) or "своих полей нет"
 
 
 def advance(lead_id: int, stage: str) -> str:

@@ -3,8 +3,12 @@ from datetime import date, datetime, timedelta, timezone
 
 MSK = timezone(timedelta(hours=3))
 
-PRICE_RE = re.compile(r"сто(ит|ят|имость)|\bцен[аыу]\b|сколько.*(сто|плат)|оплат|прайс|фикс", re.I)
-FORMAT_RE = re.compile(r"\bочно\b|\bонлайн\b|удал[её]нн|как\s+(проход|занима)|где\s+занят|формат", re.I)
+PRICE_RE = re.compile(r"сто(ит|ят|имост)|\bцен[аыуе]?\b|поч[её]м|сколько.*(сто|плат)|оплат|прайс|фикс", re.I)
+PRICE_DIRECT_RE = re.compile(r"(дайте\s+знать|озвучьте|назовите|сообщите)\s+(\w+\s+){0,3}(о\s+)?(стоимост|цен)|"
+                             r"(стоимост|цен)\w*\s+(\w+\s+){0,2}(за\s+(час|урок|занятие)|1\s+час)|просто\s+цен", re.I)
+FORMAT_RE = re.compile(r"\bочно\b|\bонлайн\b|удал[её]нн|как\s+(проход|занима)|где\s+занят|формат|"
+                       r"где\s+(будут\s+|будет\s+)?(проход|занима)|вы\s+(в|из)\s+(город\w*\s+)?(?-i:[А-ЯЁ])|"
+                       r"в\s+городе\s+\S+\s+(принима|занима|работа)|ваш\s+город|где\s+(вы\s+)?(находит|живет|живёт)", re.I)
 CLASS_RE = re.compile(r"(\d{1,2})\s*-?\s*(?:й|ый|ой|х|ых|ти|ом)?\s*кл", re.I)
 BARE_NUMBER_RE = re.compile(r"^\s*(\d{1,2})\s*[.!)]*\s*$")
 EGE_RE = re.compile(r"егэ|профил", re.I)
@@ -18,19 +22,19 @@ OUR_PRICE_RE = re.compile(r"(\d{3,5})\s*(?:р\b|р/|₽|руб)", re.I)
 RECORD_RE = re.compile(r"как.*запис|набира(ете|ют)|свобод.*мест|есть\s+мест|записат", re.I)
 AGREE_RE = re.compile(r"^\s*(да|давайте|давай|хорошо|ок|окей|можно|согласн|подходит|отлично|конечно|го|супер)\b"
                       r"|давайте|согласн|подходит|удобно|есть возможность|можно\s+(завтра|сегодня|послезавтра)", re.I)
-DECLINE_TIME_RE = re.compile(r"не\s+удобно|неудобно|не\s+подходит|не\s+сможем|не\s+можем", re.I)
+DECLINE_TIME_RE = re.compile(r"(?<![а-яё])не\s+удобно|неудобно|(?<![а-яё])не\s+подходит|(?<![а-яё])не\s+сможем|(?<![а-яё])не\s+можем", re.I)
 # Клиент отказался — не уговариваем и не зовём на пробный, вежливо прощаемся и оставляем дверь открытой
 REFUSE_RE = re.compile(r"уже\s+(нашл|наш[её]л|записал|занима|есть\s+репет)|нашли\s+друг|к\s+другому|другого\s+репет"
-                       r"|нашли\s+репет|не\s+нужн|уже\s+не\s+над|не\s+актуальн|неактуальн|передумал|не\s+интерес"
-                       r"|не\s+хоч(у|ем)|не\s+хотим|не\s+будем|не\s+планир"
-                       r"|откаж|^\s*(нет,?\s+спасибо|не надо)\s*[.!]*\s*$", re.I)
+                       r"|нашли\s+репет|(?<![а-яё])не\s+нужн|уже\s+(?<![а-яё])не\s+над|(?<![а-яё])не\s+актуальн|неактуальн|передумал|(?<![а-яё])не\s+интерес"
+                       r"|(?<![а-яё])не\s+хоч(у|ем)|(?<![а-яё])не\s+хотим|(?<![а-яё])не\s+будем|(?<![а-яё])не\s+планир"
+                       r"|откаж|^\s*(нет,?\s+спасибо|(?<![а-яё])не надо)\s*[.!]*\s*$", re.I)
 # Голое «нет» — отказ, только если мы не спрашивали про время; на «будет удобно завтра в 12:00?» это «время не подходит»
 BARE_NO_RE = re.compile(r"^\s*(нет|неь|не|нит|неа)\s*[.!]*\s*$", re.I)
 ILL_RE = re.compile(r"боле(е|ет|ю|ла|л)|заболе|нездоров|температур|простыл|в больниц", re.I)
 WILL_WRITE_RE = re.compile(r"напиш(у|ем)|сообщ(у|им)|отпиш(у|емся)|дам знать|свяжусь|свяжемся", re.I)
 # Реклама/спам от сервисов (ссылки, «попробуйте наш…») — отвечать не нужно
 SPAM_RE = re.compile(r"https?://|www\.|попробуйте\s+(провести|наш|сервис)|наш[аи]?\s+(платформ|сервис)", re.I)
-POSTPONE_RE = re.compile(r"боле(е|ет|ю|ла|л)|заболе|температур|перенес|не смож|не получ|позже|потом напиш|подума", re.I)
+POSTPONE_RE = re.compile(r"боле(е|ет|ю|ла|л)|заболе|температур|перенес|(?<![а-яё])не смож|(?<![а-яё])не получ|позже|потом напиш|подума", re.I)
 # «в 17», «в 17:30», «к 5 вечера» — время, которое назвал клиент (не «в 11 классе», не «на 70 баллов»)
 CLIENT_HOUR_RE = re.compile(r"\b(?:в|к|на)\s*(\d{1,2})(?:[:.](\d{2}))?\b(?!\s*(?:кл|бал|раз|%|\+))", re.I)
 WEEKDAYS = ["понедельник", "вторник", "сред", "четверг", "пятниц", "суббот", "воскресен"]
@@ -43,6 +47,7 @@ TIME_RE = re.compile(r"\b\d{1,2}[:.]\d{2}\b")
 # Частые вопросы клиентов (по переписке Романа и методичке)
 PHONE_Q_RE = re.compile(r"с\s+телефон|через\s+телефон|телефона\s+можно|ноутбук|компьютер\w*\s+(нет|слома)", re.I)
 DURATION_Q_RE = re.compile(r"сколько\s+(длит|продолж|идет|идёт|по\s+времени)|продолжительн|сколько\s+минут", re.I)
+ONCE_WEEK_RE = re.compile(r"(одно|один|1)\s+(\w+\s+)?(заняти\w*|урок\w*|раз)\s+в\s+неделю", re.I)
 GROUP_Q_RE = re.compile(r"индивидуальн|в\s+групп|группов|мини-?групп|один\s+на\s+один|1\s+на\s+1|несколькими", re.I)
 HOMEWORK_Q_RE = re.compile(r"домашн|д/з|\bдз\b", re.I)
 PAY_Q_RE = re.compile(r"оплат\w*\s+(за\s+кажд|раз\s+в\s+мес|помесячн)|оплачива\w*\s+(отдельно|кажд|за\s+кажд)|абонемент|как\s+(оплат|платит)|раз\s+в\s+м[еяи]сяц\s+плат",
@@ -57,10 +62,15 @@ THINK_RE = re.compile(r"подума(ю|ем|ть)|посовету(юсь|ем�
 # «очно», «очные», «очных», «оффлайн», «вживую» — но не «точно» и не «заочно»
 OFFLINE_ONLY_RE = re.compile(r"(?<![а-яё])очн\w*|оффлайн|офлайн|вживую|лично\s+приход|на\s+дому|к\s+вам\s+приход|"
                              r"приходить\s+к|адрес|в\s+пос[её]лке", re.I)
+# «онлайн не подходит», «онлайн формат не подошёл», «нам не подходит онлайн» (19.11 Елена и Ольга) — бот принимал это
+# за «время не подошло» и предлагал другое время
+ONLINE_NO_RE = re.compile(r"онлайн\w*\s+(формат\w*\s+)?(нам\s+)?(не|(?<![а-яё])не)\s*(подход|подош|устраива|вариант|"
+                          r"рассматрива|хотим|интерес|нрав)|(?<![а-яё])не\s+(подход|подош|устраива)\w*\s+(нам\s+)?онлайн|"
+                          r"(?<![а-яё])не\s+онлайн|без\s+онлайн|против\s+онлайн", re.I)
 # Клиент на связи по уроку (подключается, ждёт, не может зайти) — это момент урока, отвечает только Роман
-CONNECT_RE = re.compile(r"не\s+получа|не\s+могу\s+(зайти|войти|подключ)|не\s+открыва|зарегистр|регистрац|мы\s+(вас\s+)?ждём|"
+CONNECT_RE = re.compile(r"(?<![а-яё])не\s+получа|(?<![а-яё])не\s+могу\s+(зайти|войти|подключ)|(?<![а-яё])не\s+открыва|зарегистр|регистрац|мы\s+(вас\s+)?ждём|"
                         r"мы\s+(вас\s+)?ждем|я\s+(вас\s+)?жду|подключаемся|состоится|вы\s+где|где\s+вы|комнате\s+ожидан|"
-                        r"ну\s+что\b|я\s+зашел|я\s+зашёл|не\s+пускает|не\s+слышно|не\s+видно", re.I)
+                        r"ну\s+что\b|я\s+зашел|я\s+зашёл|(?<![а-яё])не\s+пускает|(?<![а-яё])не\s+слышно|(?<![а-яё])не\s+видно", re.I)
 # «12000 — это за сколько занятий?»
 PRICE_DETAIL_RE = re.compile(r"за\s+сколько\s+(занят|урок)|сколько\s+(занятий|уроков)\s+в\s+(месяц|неделю)|это\s+в\s+месяц|"
                              r"за\s+месяц\?|за\s+час\?", re.I)
@@ -128,7 +138,11 @@ OFFLINE_STEP_3 = ("Понимаю вас. Очно, к сожалению, не 
 FAQ_ANSWERS = {
     "phone_q": "Да, с телефона тоже можно подключиться.",
     "duration_q": "Пробное занятие займёт около 30 минут.",
-    "group_q": "Пробное занятие проходит индивидуально.",
+    "group_q": ("Есть и индивидуальные занятия, и мини-группы — формат подберём под цели ученика. "
+                "Сам пробный урок проходит индивидуально."),
+    # «нужно одно занятие в неделю» (19.11 mikolasha — бот принял это за отказ)
+    "once_week_q": ("Да, можно заниматься и один раз в неделю — оптимальную частоту подберём на пробном уроке "
+                    "по текущему уровню и цели."),
     "homework_q": ("Да, конечно, обязательно даю домашнее задание для закрепления каждой темы и детально его проверяю, "
                    "чтобы понимать, что нужно исправить и улучшить."),
     "pay_q": "Оплата — раз в месяц абонементом, в начале месяца; возможны и другие форматы, обсудим на пробном.",
@@ -233,6 +247,7 @@ def analyze_dialog(messages: list[dict], now: datetime | None = None) -> dict:
             time_passed = time_passed or not choose_between
             choose_between = []
 
+    online_no = bool(ONLINE_NO_RE.search(batch_text))
     return {
         "grade": grade,
         "exam": exam,
@@ -250,7 +265,7 @@ def analyze_dialog(messages: list[dict], now: datetime | None = None) -> dict:
         # здороваемся, только если с нашего последнего сообщения прошло больше 12 часов
         "need_greeting": not our_last or (now - _dt(our_last["created"])) > timedelta(hours=12),
         "agrees": agrees,
-        "declines_time": bool(DECLINE_TIME_RE.search(batch_text)) or (asked_time and (bare_no or bool(
+        "declines_time": not online_no and bool(DECLINE_TIME_RE.search(batch_text)) or (not online_no and asked_time and (bare_no or bool(
             re.match(r"^\W*нет\b", batch_text, re.I)) and not REFUSE_RE.search(batch_text))),
         # «не получится, только в понедельник» — это просьба о другом дне, а не «отложить»
         "postpones": bool(POSTPONE_RE.search(batch_text)) and not (day and not ILL_RE.search(batch_text)),
@@ -261,18 +276,20 @@ def analyze_dialog(messages: list[dict], now: datetime | None = None) -> dict:
         "confirmed": confirmed,
         "choose_between": choose_between,
         "time_passed": time_passed,
-        "declined": bool(REFUSE_RE.search(batch_text)) or (bare_no and not asked_time),
+        "declined": not online_no and (bool(REFUSE_RE.search(batch_text)) or (bare_no and not asked_time)),
         "spam": bool(SPAM_RE.search(batch_text)),
         "now": now,
         # вопросы из методички
         **{k: bool(rx.search(batch_text)) for k, rx in (
-            ("phone_q", PHONE_Q_RE), ("duration_q", DURATION_Q_RE), ("group_q", GROUP_Q_RE),
+            ("phone_q", PHONE_Q_RE), ("duration_q", DURATION_Q_RE), ("group_q", GROUP_Q_RE), ("once_week_q", ONCE_WEEK_RE),
             ("homework_q", HOMEWORK_Q_RE), ("pay_q", PAY_Q_RE), ("messenger_q", MESSENGER_Q_RE),
             ("thinks", THINK_RE), ("offline_only", OFFLINE_ONLY_RE), ("manual_only", MANUAL_ONLY_RE))},
+        "offline_only": online_no or bool(OFFLINE_ONLY_RE.search(batch_text)),
         # что уже говорили — чтобы не повторяться и идти по ступеням
         # 1 — ещё ничего не говорили, 2 — уже сказали «зависит от…», 3 — уже называли цифру (дальше — абонемент)
+        # «дайте знать о стоимости», «назовите цену» — просят цифру прямо: сразу ориентир, без «зависит от…»
         "price_step": 3 if (our_price or any(re.search(r"12\s?000|абонемент", m["text"]) for m in our_msgs))
-        else 2 if any("зависит от" in m["text"].lower() for m in our_msgs) else 1,
+        else 2 if any("зависит от" in m["text"].lower() for m in our_msgs) or PRICE_DIRECT_RE.search(batch_text) else 1,
         "results_said": any("вполне реально" in m["text"].lower() for m in our_msgs),
         "compare_tried": any("сравните" in m["text"].lower() for m in our_msgs),
         # сколько раз уже отвечали на «хотим очно»: 1 — ещё не отвечали, 2 — дали текст из методички, 3 — развёрнуто
@@ -723,7 +740,7 @@ def generate_variants(client_name: str, client_text: str, slots_text: str = "", 
     ]
 
 
-RECOGNIZED = ("asks_price", "asks_format", "wants_record", "agrees", "declines_time", "postpones", "declined",
+RECOGNIZED = ("once_week_q", "asks_price", "asks_format", "wants_record", "agrees", "declines_time", "postpones", "declined",
               "phone_q", "duration_q", "group_q", "homework_q", "pay_q", "messenger_q", "thinks", "offline_only",
               "choose_between", "day", "time_passed", "confirmed", "gave_phone", "take_grade_q", "price_detail_q")
 INFO_RE = re.compile(r"\d{1,2}\s*-?\s*(?:й|ый|ой)?\s*кл|^\s*\d{1,2}\s*$|егэ|огэ|профил|баз\w*\s+уров|\d{2,3}\s*\+|балл|"
