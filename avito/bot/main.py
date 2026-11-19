@@ -1189,6 +1189,19 @@ def _booking_chat(user_id: int, b: dict, dt: datetime, notify: bool = True) -> s
     return chat
 
 
+def _booking_cancel(user_id: int, chat: str, b: dict, dt: datetime, made: datetime) -> str:
+    """Текст, которым после записи отменили или перенесли пробный (клиент или мы), или ""."""
+    dialog = _load_dialog(user_id, chat)
+    if not _parse_msk(b.get("Дата и время", "")):  # запись внесена руками — считаем от последней ссылки Zoom
+        links = [m["created"] for m in dialog if m["direction"] == "out" and ZOOM_MARK in m["text"]
+                 and m["created"] <= dt.timestamp()]
+        made = datetime.fromtimestamp(links[-1], MSK) if links else made
+    after = [m for m in dialog if m["created"] > made.timestamp() + 60 and not _is_reminder(m["text"])]
+    return next((m["text"] for m in after if
+                 (m["direction"] == "in" and (CANCEL_RE.search(m["text"]) or analyze_dialog([m])["declined"]))
+                 or (m["direction"] == "out" and OUR_CANCEL_RE.search(m["text"]))), "")
+
+
 def _trial_reminders(user_id: int) -> None:
     now = datetime.now(MSK)
     latest = {}  # chat_id -> (когда урок, когда записали, строка): напоминаем только о последней записи клиента
@@ -1213,15 +1226,7 @@ def _trial_reminders(user_id: int) -> None:
                 continue
             _reminded.add(key)
             name = b.get("Имя", "")
-            dialog = _load_dialog(user_id, chat)
-            if not _parse_msk(b.get("Дата и время", "")):  # запись внесена руками — считаем от последней ссылки Zoom
-                links = [m["created"] for m in dialog if m["direction"] == "out" and ZOOM_MARK in m["text"]
-                         and m["created"] <= dt.timestamp()]
-                made = datetime.fromtimestamp(links[-1], MSK) if links else made
-            after = [m for m in dialog if m["created"] > made.timestamp() + 60 and not _is_reminder(m["text"])]
-            cancel = next((m["text"] for m in after if
-                           (m["direction"] == "in" and (CANCEL_RE.search(m["text"]) or analyze_dialog([m])["declined"]))
-                           or (m["direction"] == "out" and OUR_CANCEL_RE.search(m["text"]))), "")
+            cancel = _booking_cancel(user_id, chat, b, dt, made)
             if cancel:
                 for k2 in (k for k, *_ in REMINDERS):  # ни одного напоминания по этой записи, предупреждение одно
                     _reminded.add(f"rem{k2}_{chat}_{dt:%d%m%H%M}")
@@ -1547,6 +1552,10 @@ def amo_manual_bookings(user_id: int) -> None:
         if not c:
             continue  # ещё не узнали клиента — попробуем позже (за 3 часа до урока бот сам напишет, если не узнает)
         v = c["values"]
+        cancel = _booking_cancel(user_id, chat, b, dt, _parse_msk(b.get("Дата и время", "")) or dt - timedelta(days=1))
+        if cancel:  # после записи в чате отменили/перенесли — этап не трогаем (о напоминании Роману напишет отдельно)
+            sheets.set_state(done_key, f"{_now()} не ставил: в чате «{cancel[:100]}»")
+            continue
         phone = b.get("Телефон", "") if any(ch.isdigit() for ch in b.get("Телефон", "")) else None
         lead = _amo_safe("запись вручную", _amo_set_booked, v["id"], v, phone, when,
                          "Запись внесена вручную в лист «Записаны на пробный».")
