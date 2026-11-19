@@ -1,3 +1,4 @@
+import difflib
 import json
 import os
 import re
@@ -211,9 +212,18 @@ def today_slots() -> str:
     return sheets.get_state("slots_text", "")
 
 
+def norm_when(value: str) -> str:
+    """«19.11.2026 20.30» / «19.11.2026 9:00» → «19.11.2026 20:30» / «19.11.2026 09:00» (записи, внесённые руками)."""
+    m = re.match(r"^\s*(\d{1,2})\.(\d{1,2})\.(\d{4})\s+(\d{1,2})[:.](\d{2})\s*$", value or "")
+    if not m:
+        return (value or "").strip()
+    d, mo, y, h, mi = m.groups()
+    return f"{int(d):02d}.{int(mo):02d}.{y} {int(h):02d}:{mi}"
+
+
 def booked_set() -> set:
     """Занятые окна «дд.мм.гггг ЧЧ:ММ» из листа «Записаны на пробный»."""
-    return {b.get("Когда пробный урок", "").strip() for b in sheets.get_bookings()}
+    return {norm_when(b.get("Когда пробный урок", "")) for b in sheets.get_bookings()}
 
 
 WEEKDAY_SHORT = ["пн", "вт", "ср", "чт", "пт", "сб", "вс"]
@@ -1085,7 +1095,10 @@ REMINDERS = (("3h", timedelta(hours=3), timedelta(hours=2), timedelta(hours=1)),
              ("30m", timedelta(minutes=30), timedelta(minutes=10), timedelta(minutes=15)))
 REMINDER_MARKS = ("Напоминаю, что", "начинаем пробное занятие")
 CANCEL_RE = re.compile(r"отмен|перенес|перенос|не\s+смож|не\s+получ|не\s+успева|не\s+прид|не\s+будем|"
-                       r"заболе|боле(ет|ю|ла|л)\b|температур|передума", re.I)
+                       r"заболе|боле(ет|ю|ла|л)\b|температур|передума|нет,?\s+спасибо", re.I)
+# наши сообщения: «в 16:00, к сожалению, не получится, могу предложить…» — не отмена; отмена — только явная
+# 19.11 Ольга: «занятие можем перенести на 21.00?» → «нет, спасибо» — любое «перенести/отменить» после ссылки = не напоминаем
+OUR_CANCEL_RE = re.compile(r"отмен|перенес|перенос", re.I)
 _reminded = set()  # ключи уже отправленных напоминаний в этом процессе (и в «Состоянии» — между процессами)
 
 
@@ -1111,18 +1124,71 @@ def _reminder_text(kind: str, name: str, dt: datetime, now: datetime) -> str:
 
 def _parse_msk(value: str) -> datetime | None:
     try:
-        return datetime.strptime((value or "").strip(), "%d.%m.%Y %H:%M").replace(tzinfo=MSK)
+        return datetime.strptime(norm_when(value), "%d.%m.%Y %H:%M").replace(tzinfo=MSK)
     except ValueError:
         return None
+
+
+_chat_guess = {}  # (имя, когда) -> chat_id или "" (не понял)
+
+
+def _booking_chat(user_id: int, b: dict, dt: datetime, notify: bool = True) -> str:
+    """chat_id записи. Если его нет (Роман внёс запись руками) — ищем в «Обращениях» клиента с этим именем, которому
+    за последние 4 дня отправляли ссылку Zoom; если таких несколько — того, с кем в переписке звучало это время.
+    Не уверен — "" и одно сообщение Роману: напоминать наугад чужому человеку нельзя."""
+    chat = (b.get("chat_id") or "").strip()
+    if chat and chat != "—":
+        return chat
+    name = re.sub(r"\s+", " ", (b.get("Имя") or "").strip().lower())
+    key = (name, f"{dt:%d%m%H%M}")
+    if not name:
+        return ""
+    if key in _chat_guess:
+        return _chat_guess[key]
+    st_key = f"bchat_{dt:%d%m%H%M}_{name.replace(' ', '_')[:30]}"
+    saved = sheets.get_state(st_key, "")
+    if saved:
+        _chat_guess[key] = "" if saved == "?" else saved
+        return _chat_guess[key]
+    first = name.split()[0]
+    def similar(other: str) -> bool:
+        other = re.sub(r"\s+", " ", other.strip().lower())
+        if other == name or (" " not in name and other.split()[:1] == [first]):
+            return True
+        # «Яна Варфоломеева» в листе записей и «Яна Ворфоламеева» в Avito — тот же человек
+        return other.split()[:1] == [first] and difflib.SequenceMatcher(None, other, name).ratio() >= 0.8
+    cands = [c for c in sheets.all_contacts() if c.get("chat_id") and similar(c["Имя"])]
+    since = time.time() - 4 * 86400
+    with_link, with_time = [], []
+    marks = (f"{dt:%H:%M}", f"{dt:%H.%M}", f"{dt.hour}:{dt:%M}", f"{dt.hour}.{dt:%M}", f"в {dt.hour}")
+    for c in cands:
+        recent = [m for m in _load_dialog(user_id, c["chat_id"]) if m["created"] >= since]
+        if any(m["direction"] == "out" and ZOOM_MARK in m["text"] for m in recent):
+            with_link.append(c)
+            if any(mk in m["text"] for m in recent for mk in marks):
+                with_time.append(c)
+    pick = with_link if len(with_link) == 1 else with_time if len(with_time) == 1 else []
+    chat = pick[0]["chat_id"] if pick else ""
+    sheets.set_state(st_key, chat or "?")
+    _chat_guess[key] = chat
+    if not chat and notify:
+        who = ", ".join(f"{c['Имя']} ({c['Город']})" for c in (with_link or cands)[:4]) or "никого с таким именем"
+        tg.send_message(ADMIN_ID, f"🔔 Не смогу напомнить «{b.get('Имя', '')}» о пробном {dt:%d.%m в %H:%M}: в листе "
+                                  f"«Записаны на пробный» у этой строки нет chat_id, а по имени не понял, кто это "
+                                  f"(подходят: {who}). Впишите в строку chat_id из листа «Обращения».")
+    return chat
 
 
 def _trial_reminders(user_id: int) -> None:
     now = datetime.now(MSK)
     latest = {}  # chat_id -> (когда урок, когда записали, строка): напоминаем только о последней записи клиента
     for b in sheets.get_bookings():
-        chat = (b.get("chat_id") or "").strip()
         dt = _parse_msk(b.get("Когда пробный урок", ""))
-        if not chat or chat == "—" or not dt:
+        # chat ищем только для близких уроков: подбор по имени читает переписки
+        if not dt or not timedelta(0) <= dt - now <= timedelta(hours=3, minutes=5):
+            continue
+        chat = _booking_chat(user_id, b, dt)
+        if not chat:
             continue
         made = _parse_msk(b.get("Дата и время", "")) or dt - timedelta(days=1)
         if chat not in latest or made >= latest[chat][1]:
@@ -1138,9 +1204,14 @@ def _trial_reminders(user_id: int) -> None:
             _reminded.add(key)
             name = b.get("Имя", "")
             dialog = _load_dialog(user_id, chat)
+            if not _parse_msk(b.get("Дата и время", "")):  # запись внесена руками — считаем от последней ссылки Zoom
+                links = [m["created"] for m in dialog if m["direction"] == "out" and ZOOM_MARK in m["text"]
+                         and m["created"] <= dt.timestamp()]
+                made = datetime.fromtimestamp(links[-1], MSK) if links else made
             after = [m for m in dialog if m["created"] > made.timestamp() + 60 and not _is_reminder(m["text"])]
-            cancel = next((m["text"] for m in after if CANCEL_RE.search(m["text"]) or
-                           (m["direction"] == "in" and analyze_dialog([m])["declined"])), "")
+            cancel = next((m["text"] for m in after if
+                           (m["direction"] == "in" and (CANCEL_RE.search(m["text"]) or analyze_dialog([m])["declined"]))
+                           or (m["direction"] == "out" and OUR_CANCEL_RE.search(m["text"]))), "")
             if cancel:
                 for k2 in (k for k, *_ in REMINDERS):  # ни одного напоминания по этой записи, предупреждение одно
                     _reminded.add(f"rem{k2}_{chat}_{dt:%d%m%H%M}")
@@ -1444,20 +1515,20 @@ def amo_sync_bookings_once() -> None:
                                   "amoCRM), этап «Назначен пробный урок»:\n" + "\n".join(report))
 
 
+_user_id_for_amo = 0  # id аккаунта Avito — main() подставляет при старте (нужен, чтобы читать переписку)
+
+
 def _amo_trial_followups() -> None:
     """Через 35 минут после начала пробного спрашиваем Романа, прошёл ли он, — отмечаем в amoCRM."""
     if not _amo_on():
         return
     now = datetime.now(MSK)
     for b in sheets.get_bookings():
-        when = (b.get("Когда пробный урок") or "").strip()
-        try:
-            dt = datetime.strptime(when, "%d.%m.%Y %H:%M").replace(tzinfo=MSK)
-        except ValueError:
+        when = norm_when(b.get("Когда пробный урок") or "")
+        dt = _parse_msk(when)
+        if not dt or not timedelta(minutes=35) <= now - dt <= timedelta(days=2):
             continue
-        if not timedelta(minutes=35) <= now - dt <= timedelta(days=2):
-            continue
-        c = sheets.find_contact_by_chat((b.get("chat_id") or "").strip())
+        c = sheets.find_contact_by_chat(_booking_chat(_user_id_for_amo, b, dt, notify=False))
         row_id = c["values"]["id"] if c else ""
         if not row_id or not _amo_lead(row_id) or sheets.get_state(f"amo_trial_{row_id}", "") == when:
             continue
@@ -1691,6 +1762,7 @@ def main() -> None:
     for attempt in range(3):
         try:
             user_id = avito_client.get_self_account()["id"]
+            globals()["_user_id_for_amo"] = user_id
             break
         except Exception:
             if attempt == 2:
