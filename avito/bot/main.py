@@ -731,7 +731,7 @@ def status_text() -> str:
         lines.append("📇 amoCRM: не веду сделки — " + sheets.get_state("amo_diag", "")[21:150])
     else:
         lines.append(f"📇 amoCRM: {'веду сделки' if _amo_on() else 'выключен (/amo on)'} · после запуска: нашёл сделок "
-                     f"{s['created']}, создал {s['made']}, перевёл {s['moved']}, задач {s['tasks']}, ошибок {s['errors']}"
+                     f"{s['created']}, перевёл {s['moved']}, задач {s['tasks']}, ошибок {s['errors']}"
                      + (f"\n   последняя ошибка: {s['last_error']}" if s["last_error"] else ""))
     if ago is None:
         lines.append("Avito ещё не проверялся после запуска")
@@ -1459,12 +1459,12 @@ def _amo_first_note(name: str, city: str, category: str, chat_id: str, client_te
 
 
 def _amo_message(row_id: str, is_new: bool, name: str, city: str, category: str, chat_id: str, a: dict,
-                 client_text: str, manual_why: str, create: bool = False) -> None:
+                 client_text: str, manual_why: str) -> None:
     def run():
         lead = _amo_lead(row_id)
-        if not lead:  # сделку должна создать интеграция Avito ↔ amoCRM — ищем её; create — не дождались, создаём сами
+        if not lead:  # сделку создаёт интеграция Avito ↔ amoCRM — находим её (может появиться не сразу)
             lead = amo_crm.find_lead(name, a.get("phone"), _amo_first_note(name, city, category, chat_id, client_text),
-                                     client_text=client_text, taken=_amo_taken(), create_city=city if create else None)
+                                     client_text=client_text, taken=_amo_taken())
             _amo_save_log()
             if not lead:
                 return
@@ -1582,35 +1582,36 @@ def _amo_history_note(row_id: str, lead: int, dialog: list[dict], name: str) -> 
     sheets.set_state(f"amo_hist_{row_id}", _now())
 
 
-AMO_WAIT = timedelta(minutes=10)  # столько ждём сделку от интеграции Avito, потом создаём сами
+AMO_RETRY = 600  # секунд между поисками сделки интеграции для одного клиента
+_amo_searched = {}  # row_id -> когда последний раз искали
 
 
 def amo_catch_up(user_id: int) -> None:
-    """20.11, Роман: «почему в амо нет новых клиентов, которые написали на Avito — исправь». Интеграция Avito ↔ amoCRM
-    с 17.11 не создала ни одной сделки, а бот с 19.11 только искал её сделки. Теперь: клиент из «Обращений» за 3 дня
-    без сделки, 10 минут прошло — ищем ещё раз, не нашли — создаём сами, с полями и этапом по переписке."""
+    """Клиент из «Обращений» за 3 дня, а его сделка от интеграции Avito ↔ amoCRM ещё не найдена: ищем её снова раз
+    в 10 минут, не дожидаясь нового сообщения клиента. Нашли — заполняем поля и ставим этап по переписке и записи.
+    Сами сделки не создаём (20.11, Роман: «не бот их создавал, а они автоматически шли с Avito»)."""
     if not _amo_on() or not amo_crm.ready():
         return
     now = datetime.now(MSK)
-    made = 0
+    done = 0
     for c in sheets.all_contacts():
         row_id, chat = c.get("id", ""), c.get("chat_id", "")
         seen = _parse_msk(f"{c.get('Дата', '')} {c.get('Время', '')}")
-        if (not row_id or not chat or not seen or not AMO_WAIT <= now - seen <= timedelta(days=3)
-                or _amo_lead(row_id) or sheets.get_state(f"amo_skip_{row_id}", "")):
+        if (not row_id or not chat or not seen or not timedelta(0) <= now - seen <= timedelta(days=3)
+                or _amo_lead(row_id) or sheets.get_state(f"amo_skip_{row_id}", "")
+                or time.time() - _amo_searched.get(row_id, 0) < AMO_RETRY):
             continue
-        if made >= 5:  # не больше 5 за проверку: остальных — через минуту
+        if done >= 5:  # не больше 5 за проверку: остальных — через минуту
             break
-        made += 1
+        done += 1
+        _amo_searched[row_id] = time.time()
         dialog = _load_dialog(user_id, chat)
         a = analyze_dialog(dialog) if dialog else {}
         if a.get("spam"):
             sheets.set_state(f"amo_skip_{row_id}", "реклама")
             continue
         _amo_message(row_id, True, c.get("Имя", ""), c.get("Город", ""), c.get("Категория", ""), chat, a,
-                     a.get("batch_text") or c.get("Сообщение клиента", ""), "", create=True)
-        if _amo_lead(row_id) and "создал сам" in (amo_crm.match_log[-1:] or [""])[0]:
-            _amo_safe("переписка в сделку", _amo_history_note, row_id, _amo_lead(row_id), dialog, c.get("Имя", ""))
+                     a.get("batch_text") or c.get("Сообщение клиента", ""), "")
         booking = next((b for b in reversed(sheets.get_bookings()) if (b.get("chat_id") or "").strip() == chat), None)
         dt = _parse_msk(norm_when(booking.get("Когда пробный урок", ""))) if booking else None
         if _amo_lead(row_id) and dt and dt >= now - timedelta(hours=2):
