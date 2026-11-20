@@ -378,6 +378,21 @@ def advance(lead_id: int, stage: str) -> str:
     return "перевёл"
 
 
+def back_to_qualified(lead_id: int) -> str:
+    """20.11, Роман: «если не проведён пробный урок — клиента переноси в Квалифицирован назад». Назад двигаем только
+    с «Назначен пробный урок» / «Проведен пробный урок»: если Роман перенёс сделку дальше, в другую воронку или
+    закрыл её — не трогаем."""
+    lead = _get(f"leads/{lead_id}")
+    cur = lead.get("status_id")
+    if lead.get("pipeline_id") != _pipe["id"]:
+        return "в другой воронке — не трогаю"
+    if cur not in (_pipe["stage"]["booked"], _pipe["stage"]["trial_done"]):
+        return "не на этапе пробного урока — не трогаю"
+    _req("PATCH", f"leads/{lead_id}", body={"status_id": _pipe["stage"]["qualified"], "pipeline_id": _pipe["id"]})
+    stats["moved"] += 1
+    return "перевёл"
+
+
 def close_lost(lead_id: int) -> str:
     lead = _get(f"leads/{lead_id}")
     if lead.get("pipeline_id") != _pipe["id"] or lead.get("status_id") in (WON, LOST):

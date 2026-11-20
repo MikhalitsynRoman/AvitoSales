@@ -596,10 +596,18 @@ def handle_callback(user_id: int, cq: dict) -> None:
             text = (f"✅ Пробный с {v['Имя']} проведён — в amoCRM «Проведен пробный урок»." if ok
                     else f"⚠️ Не получилось отметить в amoCRM пробный с {v['Имя']} — подробности в /status.")
         else:
-            ok = _amo_safe("не пришёл на пробный", lambda: (
-                amo_crm.note(lead, "Не пришёл на пробный урок."),
-                amo_crm.task(lead, f"{v['Имя']} не пришёл на пробный — связаться и перенести", hours=2), "ok")[2])
-            text = (f"🚫 {v['Имя']} не пришёл на пробный — поставил в amoCRM задачу связаться." if ok
+            def not_held():
+                moved = amo_crm.back_to_qualified(lead)
+                amo_crm.note(lead, "Пробный урок не проведён (клиент не пришёл)."
+                             + (" Сделка возвращена на «Квалифицирован»." if moved == "перевёл" else ""))
+                amo_crm.task(lead, f"Назначить пробный урок: {v['Имя']} не пришёл на пробный — связаться и "
+                                   "договориться о новом времени", hours=2)
+                return moved
+            moved = _amo_safe("не пришёл на пробный", not_held)
+            ok = moved is not None
+            text = (f"🚫 {v['Имя']} не пришёл на пробный — в amoCRM "
+                    + ("вернул сделку на «Квалифицирован» и " if moved == "перевёл" else f"этап не менял ({moved}), ")
+                    + "поставил задачу «Назначить пробный урок»." if ok
                     else f"⚠️ Не получилось отметить в amoCRM — подробности в /status.")
         # не получилось — кнопки оставляем, можно нажать ещё раз
         tg.edit_message_text(ADMIN_ID, message_id, text, {"inline_keyboard": []} if ok else tg.inline_keyboard(
