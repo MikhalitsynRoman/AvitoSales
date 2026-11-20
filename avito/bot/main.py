@@ -206,7 +206,22 @@ def _same_day(value: str, today: str) -> bool:
         return False
 
 
+def slots_override() -> dict | None:
+    """Временное расписание по датам (state slots_only = {"until": "дд.мм.гггг", "days": {"дд.мм.гггг": "14:00-21:00"}}):
+    пока не прошла дата until, приглашаем только в эти дни и часы, остальные дни — без окон.
+    20.11, Роман: «на сегодня больше не приглашай, приглашай только на завтра с 14 до 21»."""
+    try:
+        o = json.loads(sheets.get_state("slots_only", "") or "{}")
+        until = datetime.strptime(o.get("until", ""), "%d.%m.%Y").date()
+    except (ValueError, TypeError, AttributeError):
+        return None
+    return (o.get("days") or {}) if datetime.now(MSK).date() <= until else None
+
+
 def today_slots() -> str:
+    o = slots_override()
+    if o is not None:
+        return o.get(today_str(), "")
     if not _same_day(sheets.get_state("slots_date", ""), today_str()):
         return ""
     return sheets.get_state("slots_text", "")
@@ -240,6 +255,9 @@ def week_slots() -> dict:
 
 def day_slots_text(d) -> str:
     """Часы на день: на сегодня — то, что Роман прислал утром (если прислал), иначе — недельное расписание."""
+    o = slots_override()
+    if o is not None:
+        return o.get(d.strftime("%d.%m.%Y"), "")
     if d == datetime.now(MSK).date() and today_slots():
         return today_slots()
     return week_slots().get(d.weekday(), "")
@@ -1025,7 +1043,7 @@ def maybe_ask_daily_slots() -> None:
     week = week_slots()
     if week:
         # есть недельное расписание — не спрашиваем, а напоминаем, что предлагаем сегодня; в выходной молчим
-        todays = week.get(datetime.now(MSK).weekday())
+        todays = day_slots_text(datetime.now(MSK).date())
         if not todays:
             sheets.set_state("slots_prompt_date", today)
             return
