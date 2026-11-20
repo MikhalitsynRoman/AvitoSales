@@ -28,7 +28,7 @@ TAG = "Avito-бот"
 
 _session = requests.Session()
 _pipe = None  # {"id": воронка, "order": [id этапов по порядку], "stage": {"new": id, ...}}
-stats = {"created": 0, "moved": 0, "notes": 0, "tasks": 0, "errors": 0, "last_error": ""}
+stats = {"created": 0, "made": 0, "moved": 0, "notes": 0, "tasks": 0, "errors": 0, "last_error": ""}
 
 
 def _domain() -> str:
@@ -198,21 +198,40 @@ def _channel_lead(name: str, client_text: str, taken: set) -> tuple[int | None, 
 
 
 def find_lead(name: str, phone: str | None, first_note: str, stage: str = "new",
-              client_text: str = "", taken: set = frozenset()) -> int | None:
-    """Сделку создаёт интеграция Avito ↔ amoCRM (19.11 Роман: «пусть заявки идут напрямую через интеграцию, а ты
-    находи их и двигай»). Бот только ищет её: по телефону, в «Неразобранном» (принимает), среди принятых сделок.
-    Не нашёл — None: попробуем при следующем сообщении клиента (сделка интеграции могла ещё не появиться)."""
-    lead_id, _ = _open_lead_by_phone(phone) if phone else (None, None)
+              client_text: str = "", taken: set = frozenset(), create_city: str | None = None) -> int | None:
+    """Сделку должна создавать интеграция Avito ↔ amoCRM (19.11 Роман: «пусть заявки идут напрямую через интеграцию,
+    а ты находи их и двигай»). Сначала ищем её: по телефону, в «Неразобранном» (принимаем), среди принятых сделок.
+    Не нашли: create_city is None — None (поищем позже); иначе создаём сделку сами (20.11: интеграция с 17.11 не
+    создала ни одной сделки, и новые клиенты в amoCRM не попадали — Роман: «исправь это»)."""
+    lead_id, contact_id = _open_lead_by_phone(phone) if phone else (None, None)
     if lead_id and lead_id not in taken:
         _log_match(f"«{name}»: нашёл открытую сделку #{lead_id} по телефону")
     else:
         lead_id = _channel_lead(name, client_text, taken)[0]
+    if not lead_id and create_city is not None:
+        return _create_lead(name, create_city, phone, contact_id, first_note, stage)
     if not lead_id:
-        _log_match(f"«{name}»: сделки от интеграции Avito пока нет — свою не создаю, поищу при следующем сообщении")
+        _log_match(f"«{name}»: сделки от интеграции Avito пока нет — подожду её 10 минут, потом создам сам")
         return None
     stats["created"] += 1  # в /status: «нашёл сделок»
     note(lead_id, first_note)
     advance(lead_id, stage)
+    return lead_id
+
+
+def _create_lead(name: str, city: str, phone: str | None, contact_id: int | None, first_note: str, stage: str) -> int:
+    contact = {"id": contact_id} if contact_id else {"first_name": name or "Клиент Avito"}
+    if phone and not contact_id:
+        contact["custom_fields_values"] = [{"field_code": "PHONE", "values": [{"value": phone, "enum_code": "WORK"}]}]
+    title = f"{name or 'Клиент'} — Avito" + (f" ({city})" if city and city != "—" else "")
+    res = _req("POST", "leads/complex", body=[{
+        "name": title[:250], "pipeline_id": _pipe["id"], "status_id": _pipe["stage"][stage],
+        "_embedded": {"contacts": [contact], "tags": [{"name": TAG}]},
+    }])
+    lead_id = res[0]["id"]
+    stats["made"] += 1
+    _log_match(f"«{name}»: интеграция Avito сделку не создала — создал сам #{lead_id}")
+    note(lead_id, first_note)
     return lead_id
 
 
