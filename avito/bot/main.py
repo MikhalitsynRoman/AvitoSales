@@ -1578,7 +1578,13 @@ def _amo_history_note(row_id: str, lead: int, dialog: list[dict], name: str) -> 
     lines = [f"{datetime.fromtimestamp(m['created'], MSK):%d.%m %H:%M} "
              f"{(name or 'Клиент') if m['direction'] == 'in' else 'Мы'}: {m['text'].strip()}" for m in msgs]
     text = "Переписка в Avito до создания сделки:\n\n" + "\n\n".join(lines)
-    amo_crm.note(lead, text[-15000:])
+    try:
+        amo_crm.note(lead, text[-15000:])
+    except RuntimeError as e:
+        if "226" not in str(e):
+            raise
+        # amoCRM не принял какой-то символ — оставляем только буквы, цифры и обычную пунктуацию
+        amo_crm.note(lead, re.sub(r"[^\w\s.,:;!?()«»\"'+\-–—/№%₽@#]", "·", text[-15000:]))
     sheets.set_state(f"amo_hist_{row_id}", _now())
 
 
@@ -1619,17 +1625,24 @@ def amo_catch_up(user_id: int) -> None:
                       "Ссылка Zoom отправлена.")
 
 
+BOT_MADE_LEADS = {38637043, 38637047, 38637049, 38637053}  # 20.11 15:32–15:33 сделки создал бот (Полина, ОПРАВА, Тетя-мотя, Наташа)
+_hist_tries = {}
+
+
 def amo_history_backfill_once(user_id: int) -> None:
+    """Один раз: переписка из Avito в сделки, которые бот создал 20.11, пока интеграция не создавала сделок."""
     if not _amo_on() or not amo_crm.ready() or sheets.get_state("amo_hist_done", "") == "v1":
         return
-    made = set(re.findall(r"создал сам #(\d+)", sheets.get_state("amo_match_log", "") + "\n".join(amo_crm.match_log)))
     for c in sheets.all_contacts():
         lead = _amo_lead(c.get("id", ""))
-        if lead and str(lead) in made and not sheets.get_state(f"amo_hist_{c['id']}", ""):
-            dialog = _load_dialog(user_id, c["chat_id"])
-            if dialog and _amo_safe("переписка в сделку", _amo_history_note, c["id"], lead, dialog, c.get("Имя", "")) is None \
-                    and not sheets.get_state(f"amo_hist_{c['id']}", ""):
-                return  # amoCRM не ответил — повторим при следующей проверке
+        if lead not in BOT_MADE_LEADS or sheets.get_state(f"amo_hist_{c['id']}", "") or _hist_tries.get(c["id"], 0) >= 3:
+            continue
+        _hist_tries[c["id"]] = _hist_tries.get(c["id"], 0) + 1
+        dialog = _load_dialog(user_id, c["chat_id"])
+        if dialog:
+            _amo_safe("переписка в сделку", _amo_history_note, c["id"], lead, dialog, c.get("Имя", ""))
+        if not sheets.get_state(f"amo_hist_{c['id']}", "") and _hist_tries[c["id"]] < 3:
+            return  # не получилось — повторим при следующей проверке (всего 3 попытки)
     sheets.set_state("amo_hist_done", "v1")
 
 

@@ -106,6 +106,8 @@ def _fail(e: Exception) -> None:
 
 
 def note(lead_id: int, text: str) -> None:
+    # amoCRM отвечает «Error 226» на эмодзи и другие символы вне BMP в тексте заметки (20.11, переписка ОПРАВА)
+    text = "".join(ch if ord(ch) <= 0xFFFF else "·" for ch in text)
     _req("POST", f"leads/{lead_id}/notes", body=[{"note_type": "common", "params": {"text": text[:20000]}}])
     stats["notes"] += 1
 
