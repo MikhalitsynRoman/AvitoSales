@@ -1631,7 +1631,7 @@ _hist_tries = {}
 
 def amo_history_backfill_once(user_id: int) -> None:
     """Один раз: переписка из Avito в сделки, которые бот создал 20.11, пока интеграция не создавала сделок."""
-    if not _amo_on() or not amo_crm.ready() or sheets.get_state("amo_hist_done", "") == "v1":
+    if not _amo_on() or not amo_crm.ready() or sheets.get_state("amo_hist_done", "") == "v2":
         return
     for c in sheets.all_contacts():
         lead = _amo_lead(c.get("id", ""))
@@ -1643,7 +1643,7 @@ def amo_history_backfill_once(user_id: int) -> None:
             _amo_safe("переписка в сделку", _amo_history_note, c["id"], lead, dialog, c.get("Имя", ""))
         if not sheets.get_state(f"amo_hist_{c['id']}", "") and _hist_tries[c["id"]] < 3:
             return  # не получилось — повторим при следующей проверке (всего 3 попытки)
-    sheets.set_state("amo_hist_done", "v1")
+    sheets.set_state("amo_hist_done", "v2")
 
 
 _user_id_for_amo = 0  # id аккаунта Avito — main() подставляет при старте (нужен, чтобы читать переписку)
