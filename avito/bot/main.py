@@ -1567,6 +1567,21 @@ def amo_manual_bookings(user_id: int) -> None:
                                       "сделку в amoCRM поставил на «Назначен пробный урок».")
 
 
+def _amo_history_note(row_id: str, lead: int, dialog: list[dict], name: str) -> None:
+    """20.11, Роман: «почему у этих клиентов не видно переписки в амо?» Чат Avito в карточке amoCRM показывает только
+    у сделок от интеграции; в сделку, которую создал бот, кладём всю переписку до неё одной заметкой (один раз)."""
+    if sheets.get_state(f"amo_hist_{row_id}", ""):
+        return
+    msgs = [m for m in dialog if m["text"].strip() and not m.get("system")][-40:]
+    if not msgs:
+        return
+    lines = [f"{datetime.fromtimestamp(m['created'], MSK):%d.%m %H:%M} "
+             f"{(name or 'Клиент') if m['direction'] == 'in' else 'Мы'}: {m['text'].strip()}" for m in msgs]
+    text = "Переписка в Avito до создания сделки:\n\n" + "\n\n".join(lines)
+    amo_crm.note(lead, text[-15000:])
+    sheets.set_state(f"amo_hist_{row_id}", _now())
+
+
 AMO_WAIT = timedelta(minutes=10)  # столько ждём сделку от интеграции Avito, потом создаём сами
 
 
@@ -1594,11 +1609,27 @@ def amo_catch_up(user_id: int) -> None:
             continue
         _amo_message(row_id, True, c.get("Имя", ""), c.get("Город", ""), c.get("Категория", ""), chat, a,
                      a.get("batch_text") or c.get("Сообщение клиента", ""), "", create=True)
+        if _amo_lead(row_id) and "создал сам" in (amo_crm.match_log[-1:] or [""])[0]:
+            _amo_safe("переписка в сделку", _amo_history_note, row_id, _amo_lead(row_id), dialog, c.get("Имя", ""))
         booking = next((b for b in reversed(sheets.get_bookings()) if (b.get("chat_id") or "").strip() == chat), None)
         dt = _parse_msk(norm_when(booking.get("Когда пробный урок", ""))) if booking else None
         if _amo_lead(row_id) and dt and dt >= now - timedelta(hours=2):
             _amo_safe("запись на пробный", _amo_set_booked, row_id, c, None, norm_when(booking["Когда пробный урок"]),
                       "Ссылка Zoom отправлена.")
+
+
+def amo_history_backfill_once(user_id: int) -> None:
+    if not _amo_on() or not amo_crm.ready() or sheets.get_state("amo_hist_done", "") == "v1":
+        return
+    made = set(re.findall(r"создал сам #(\d+)", sheets.get_state("amo_match_log", "") + "\n".join(amo_crm.match_log)))
+    for c in sheets.all_contacts():
+        lead = _amo_lead(c.get("id", ""))
+        if lead and str(lead) in made and not sheets.get_state(f"amo_hist_{c['id']}", ""):
+            dialog = _load_dialog(user_id, c["chat_id"])
+            if dialog and _amo_safe("переписка в сделку", _amo_history_note, c["id"], lead, dialog, c.get("Имя", "")) is None \
+                    and not sheets.get_state(f"amo_hist_{c['id']}", ""):
+                return  # amoCRM не ответил — повторим при следующей проверке
+    sheets.set_state("amo_hist_done", "v1")
 
 
 _user_id_for_amo = 0  # id аккаунта Avito — main() подставляет при старте (нужен, чтобы читать переписку)
@@ -1824,6 +1855,7 @@ def _run_avito_check(user_id: int) -> None:
             amo_fields_once(user_id)
             amo_manual_bookings(user_id)
             amo_catch_up(user_id)
+            amo_history_backfill_once(user_id)
             _amo_trial_followups()
         except Exception as e:
             _note_error("amoCRM (пробные)", e)
