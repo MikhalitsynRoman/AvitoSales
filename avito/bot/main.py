@@ -496,6 +496,8 @@ def _log_trial_booking(row_id: str, v: dict) -> None:
 def _amo_set_booked(row_id: str, v: dict, phone: str | None, when: str, how: str) -> int:
     """Сделка клиента (строка «Обращений» row_id) → «Назначен пробный урок», заметка и «· пробный …» в комментарии.
     Сделку не создаём: её заводит интеграция Avito ↔ amoCRM; не нашли — одно сообщение Роману."""
+    if sheets.get_state(f"amo_skip_{row_id}", ""):
+        return 0  # Роман попросил этого клиента в amoCRM не добавлять
     lead = _amo_lead(row_id)
     if not lead:
         lead = amo_crm.find_lead(v["Имя"], phone, _amo_first_note(v["Имя"], v["Город"], v["Категория"], v["chat_id"], ""),
@@ -1469,6 +1471,8 @@ def _amo_first_note(name: str, city: str, category: str, chat_id: str, client_te
 def _amo_message(row_id: str, is_new: bool, name: str, city: str, category: str, chat_id: str, a: dict,
                  client_text: str, manual_why: str) -> None:
     def run():
+        if sheets.get_state(f"amo_skip_{row_id}", ""):
+            return  # Роман попросил этого клиента в amoCRM не добавлять
         lead = _amo_lead(row_id)
         if not lead:  # сделку создаёт интеграция Avito ↔ amoCRM — находим её (может появиться не сразу)
             lead = amo_crm.find_lead(name, a.get("phone"), _amo_first_note(name, city, category, chat_id, client_text),
@@ -1631,6 +1635,26 @@ def amo_catch_up(user_id: int) -> None:
         if _amo_lead(row_id) and dt and dt >= now - timedelta(hours=2):
             _amo_safe("запись на пробный", _amo_set_booked, row_id, c, None, norm_when(booking["Когда пробный урок"]),
                       "Ссылка Zoom отправлена.")
+
+
+AMO_REMOVE = {"b3858ece": 38637043, "7b120b3c": 38637047}  # 20.11, Роман: «Полину удали и больше не добавляй, ОПРАВУ тоже удали»
+
+
+def amo_remove_once() -> None:
+    if not _amo_on() or not amo_crm.ready() or sheets.get_state("amo_removed", "") == "v1":
+        return
+    sheets.set_state("amo_removed", "v1")
+    report = []
+    for row_id, lead in AMO_REMOVE.items():
+        sheets.set_state(f"amo_skip_{row_id}", "Роман: удалить и больше не добавлять")
+        sheets.set_state(f"amo_{row_id}", "")
+        c = sheets.get_contact_by_id(row_id)
+        res = _amo_safe("удаление сделки", amo_crm.delete_lead, lead) or "не удалось (см. /status)"
+        report.append(f"• {c['values']['Имя'] if c else row_id} #{lead}: {res}")
+    sheets.set_state("amo_removed_report", "\n".join(report))
+    left = [r for r in report if not r.endswith(": удалил")]
+    tg.send_message(ADMIN_ID, "📇 amoCRM: этих клиентов больше не веду и в amoCRM не добавляю:\n" + "\n".join(report)
+                    + ("\n\nСделки, которые не удалились, удалите в amoCRM вручную." if left else ""))
 
 
 BOT_MADE_LEADS = {38637043, 38637047, 38637049, 38637053}  # 20.11 15:32–15:33 сделки создал бот (Полина, ОПРАВА, Тетя-мотя, Наташа)
@@ -1876,6 +1900,7 @@ def _run_avito_check(user_id: int) -> None:
             amo_sync_bookings_once()
             amo_fields_once(user_id)
             amo_manual_bookings(user_id)
+            amo_remove_once()
             amo_catch_up(user_id)
             amo_history_backfill_once(user_id)
             _amo_trial_followups()

@@ -393,6 +393,15 @@ def back_to_qualified(lead_id: int) -> str:
     return "перевёл"
 
 
+def delete_lead(lead_id: int) -> str:
+    """Удаление сделки — только по прямой просьбе Романа (20.11: Полина и ОПРАВА)."""
+    try:
+        _req("DELETE", f"leads/{lead_id}")
+        return "удалил"
+    except RuntimeError as e:
+        return f"не удалось через API ({str(e)[:80]})"
+
+
 def close_lost(lead_id: int) -> str:
     lead = _get(f"leads/{lead_id}")
     if lead.get("pipeline_id") != _pipe["id"] or lead.get("status_id") in (WON, LOST):
