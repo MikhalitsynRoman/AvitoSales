@@ -15,7 +15,8 @@ import sheets  # noqa: E402
 import telegram_api as tg  # noqa: E402
 import ai_reply  # noqa: E402
 import amo_crm  # noqa: E402
-from script_engine import (TIME_RE, ZOOM_MARK, analyze_dialog, auto_decision, booking_key,  # noqa: E402
+from script_engine import (MONTHS, TIME_RE, ZOOM_MARK, _client_time, _requested_date,  # noqa: E402
+                           analyze_dialog, auto_decision, booking_key,
                            category_text, confirm_block, day_label, expand_slots, generate_variants, is_past)
 
 MSK = timezone(timedelta(hours=3))
@@ -759,7 +760,7 @@ def status_text() -> str:
         lines.append("📇 amoCRM: не веду сделки — " + sheets.get_state("amo_diag", "")[21:150])
     else:
         lines.append(f"📇 amoCRM: {'веду сделки' if _amo_on() else 'выключен (/amo on)'} · после запуска: нашёл сделок "
-                     f"{s['created']}, перевёл {s['moved']}, задач {s['tasks']}, ошибок {s['errors']}"
+                     f"{s['created']}, создал {s['made']}, перевёл {s['moved']}, задач {s['tasks']}, ошибок {s['errors']}"
                      + (f"\n   последняя ошибка: {s['last_error']}" if s["last_error"] else ""))
     if ago is None:
         lines.append("Avito ещё не проверялся после запуска")
@@ -1069,6 +1070,8 @@ def check_new_avito_messages(user_id: int) -> None:
     seen_ids = sheets.get_logged_msg_ids()
 
     chats = avito_client.get_all_chats(user_id, max_chats=MAX_CHATS_TO_SCAN)
+    global _last_chats
+    _last_chats = chats
     for chat in chats:
         last = chat.get("last_message") or {}
         if last.get("direction") != "in":
@@ -1228,6 +1231,104 @@ def _booking_cancel(user_id: int, chat: str, b: dict, dt: datetime, made: dateti
     return next((m["text"] for m in after if
                  (m["direction"] == "in" and (CANCEL_RE.search(m["text"]) or analyze_dialog([m])["declined"]))
                  or (m["direction"] == "out" and OUR_CANCEL_RE.search(m["text"]))), "")
+
+
+_last_chats = []  # чаты последней проверки Avito
+_link_seen = {}  # chat_id -> id последнего сообщения, после которого уже искали ссылку Zoom
+DATE_WORD_RE = re.compile(r"(\d{1,2})\s+(" + "|".join(MONTHS) + r")", re.I)
+
+
+def _time_in_text(text: str, sent: datetime) -> datetime | None:
+    """Когда пробный по нашему сообщению: «записала вас на субботу, 21 ноября в 13.00», «сегодня в 13.00», «завтра в 18:30»."""
+    t = re.sub(r"https?://\S+", " ", text)
+    t = re.sub(r"\b(\d{1,2}),(\d{2})\b", r"\1:\2", t)  # «на 14,30»
+    hhmm = _client_time(t)
+    if not hhmm:
+        return None
+    h, mi = map(int, hhmm.split(":"))
+    m = DATE_WORD_RE.search(t)
+    if m:
+        try:
+            d = sent.replace(month=MONTHS.index(m.group(2).lower()) + 1, day=int(m.group(1))).date()
+        except ValueError:
+            return None
+        if d < sent.date() - timedelta(days=7):  # «5 января», написанное в декабре
+            d = d.replace(year=d.year + 1)
+    else:
+        d = _requested_date(t, sent)
+        if d is None:  # только время: ближайшее после отправки
+            d = sent.date() if (h, mi) > (sent.hour, sent.minute) else sent.date() + timedelta(days=1)
+    return datetime(d.year, d.month, d.day, h, mi, tzinfo=MSK)
+
+
+def avito_link_bookings(user_id: int) -> None:
+    """21.11: Надюшку Алексеевну записали прямо в Avito (ссылку Zoom отправили не через бота) — строки в «Записаны на
+    пробный» не было, и бот не напомнил о пробном. Теперь: в чате появилась наша ссылка Zoom не от бота — понимаем
+    по нашим сообщениям, на какое время, и сами добавляем запись (напоминания, amoCRM). Не поняли — пишем Роману."""
+    now = datetime.now(MSK)
+    for chat in _last_chats:
+        last = chat.get("last_message") or {}
+        cid = chat.get("id", "")
+        if not cid or now.timestamp() - (last.get("created") or 0) > 3 * 86400 or _link_seen.get(cid) == last.get("id"):
+            continue
+        _link_seen[cid] = last.get("id")
+        c = sheets.find_contact_by_chat(cid)
+        if not c:
+            continue
+        dialog = _load_dialog(user_id, cid)
+        links = [i for i, m in enumerate(dialog) if m["direction"] == "out" and ZOOM_MARK in m["text"]
+                 and not _is_reminder(m["text"]) and now.timestamp() - m["created"] <= 3 * 86400]
+        if not links:
+            continue
+        i = links[-1]
+        link = dialog[i]
+        key = f"avlink_{cid[:24]}_{int(link['created'])}"
+        if sheets.get_state(key, ""):
+            continue
+        sent = datetime.fromtimestamp(link["created"], MSK)
+        v = c["values"]
+        books = sheets.get_bookings()
+        # ссылку отправил бот — запись он уже сделал сам (в ту же минуту)
+        if any((b.get("chat_id") or "").strip() == cid and (_parse_msk(b.get("Дата и время", "")) or now) >= sent - timedelta(minutes=10)
+               for b in books):
+            sheets.set_state(key, "запись уже есть (бот)")
+            continue
+        # время ищем в самой ссылке, потом в наших сообщениях за 12 часов до неё, потом в ответах клиента
+        # («Сегодня в 17,00 договорились?» — «Да в 17.00»); «сегодня/завтра» — от даты того сообщения
+        before = [m for m in dialog[max(0, i - 12):i] if link["created"] - m["created"] <= 12 * 3600 and m["text"].strip()]
+        dt = _time_in_text(link["text"], sent)
+        for m in sorted(reversed(before), key=lambda m: m["direction"] != "out"):
+            dt = dt or _time_in_text(m["text"], datetime.fromtimestamp(m["created"], MSK))
+        if not dt:
+            conf = analyze_dialog(dialog[:i + 1]).get("confirmed")
+            if conf:
+                h, mi = map(int, conf[1].split(":"))
+                d = conf[0] or sent.date()
+                dt = datetime(d.year, d.month, d.day, h, mi, tzinfo=MSK)
+        if not dt:
+            sheets.set_state(key, "время не понял")
+            if now - sent <= timedelta(hours=12):
+                tg.send_message(ADMIN_ID, f"📅 В Avito отправили ссылку Zoom {v['Имя']} ({v['Город']}), но я не понял, на "
+                                          "какое время пробный. Впишите запись в лист «Записаны на пробный» — тогда "
+                                          "напомню клиенту за 3 часа и за 30 минут.")
+            continue
+        when = f"{dt:%d.%m.%Y %H:%M}"
+        first = (v.get("Имя") or "").strip().lower().split()[:1]
+        if dt < now - timedelta(hours=3) or any(
+                norm_when(b.get("Когда пробный урок", "")) == when and ((b.get("chat_id") or "").strip() == cid or (
+                    (b.get("chat_id") or "").strip() in ("", "—") and (b.get("Имя") or "").strip().lower().split()[:1] == first))
+                for b in books):
+            sheets.set_state(key, f"не добавлял: {when}")
+            continue
+        sheets.log_booking(v["Имя"], "—", cid, when, v.get("Категория", ""))
+        sheets.set_state(key, f"добавил {when}")
+        _amo_safe("запись в Avito", _amo_set_booked, v["id"], v, None, when, "Ссылка Zoom отправлена в Avito.")
+        late = dt - now < timedelta(minutes=10)
+        tg.send_message(ADMIN_ID, f"📅 Вижу запись в Avito: {v['Имя']} ({v['Город']}), пробный "
+                                  f"{day_label(dt.date(), now.date())} в {dt:%H:%M}. Добавил в «Записаны на пробный»"
+                                  + (". Напомнить клиенту уже не успел." if late else
+                                     ", напомню клиенту за 3 часа и за 30 минут.")
+                                  + " Если время другое — поправьте в листе.")
 
 
 def _trial_reminders(user_id: int) -> None:
@@ -1487,14 +1588,14 @@ def _amo_first_note(name: str, city: str, category: str, chat_id: str, client_te
 
 
 def _amo_message(row_id: str, is_new: bool, name: str, city: str, category: str, chat_id: str, a: dict,
-                 client_text: str, manual_why: str) -> None:
+                 client_text: str, manual_why: str, create: bool = False) -> None:
     def run():
         if sheets.get_state(f"amo_skip_{row_id}", ""):
             return  # Роман попросил этого клиента в amoCRM не добавлять
         lead = _amo_lead(row_id)
         if not lead:  # сделку создаёт интеграция Avito ↔ amoCRM — находим её (может появиться не сразу)
             lead = amo_crm.find_lead(name, a.get("phone"), _amo_first_note(name, city, category, chat_id, client_text),
-                                     client_text=client_text, taken=_amo_taken())
+                                     client_text=client_text, taken=_amo_taken(), create_city=city if create else None)
             _amo_save_log()
             if not lead:
                 return
@@ -1619,13 +1720,15 @@ def _amo_history_note(row_id: str, lead: int, dialog: list[dict], name: str) -> 
 
 
 AMO_RETRY = 600  # секунд между поисками сделки интеграции для одного клиента
+AMO_WAIT = timedelta(minutes=15)  # столько ждём сделку от интеграции Avito, потом создаём сами
 _amo_searched = {}  # row_id -> когда последний раз искали
 
 
 def amo_catch_up(user_id: int) -> None:
     """Клиент из «Обращений» за 3 дня, а его сделка от интеграции Avito ↔ amoCRM ещё не найдена: ищем её снова раз
     в 10 минут, не дожидаясь нового сообщения клиента. Нашли — заполняем поля и ставим этап по переписке и записи.
-    Сами сделки не создаём (20.11, Роман: «не бот их создавал, а они автоматически шли с Avito»)."""
+    Через 15 минут сделки интеграции всё нет — создаём сами (21.11, Роман: «они всегда должны попадать в амо»),
+    с перепиской из Avito заметкой. Клиентов, которых Роман просил не добавлять (amo_skip_), не трогаем."""
     if not _amo_on() or not amo_crm.ready():
         return
     now = datetime.now(MSK)
@@ -1646,8 +1749,11 @@ def amo_catch_up(user_id: int) -> None:
         if a.get("spam"):
             sheets.set_state(f"amo_skip_{row_id}", "реклама")
             continue
+        made_before = amo_crm.stats["made"]
         _amo_message(row_id, True, c.get("Имя", ""), c.get("Город", ""), c.get("Категория", ""), chat, a,
-                     a.get("batch_text") or c.get("Сообщение клиента", ""), "")
+                     a.get("batch_text") or c.get("Сообщение клиента", ""), "", create=now - seen >= AMO_WAIT)
+        if _amo_lead(row_id) and amo_crm.stats["made"] > made_before:
+            _amo_safe("переписка в сделку", _amo_history_note, row_id, _amo_lead(row_id), dialog, c.get("Имя", ""))
         booking = next((b for b in reversed(sheets.get_bookings()) if (b.get("chat_id") or "").strip() == chat), None)
         dt = _parse_msk(norm_when(booking.get("Когда пробный урок", ""))) if booking else None
         if _amo_lead(row_id) and dt and dt >= now - timedelta(hours=2):
@@ -1910,6 +2016,10 @@ def _run_avito_check(user_id: int) -> None:
     try:
         maybe_ask_daily_slots()
         check_new_avito_messages(user_id)
+        try:
+            avito_link_bookings(user_id)
+        except Exception as e:
+            _note_error("запись из Avito", e)
         try:
             _trial_reminders(user_id)
         except Exception as e:
