@@ -1588,14 +1588,15 @@ def _amo_first_note(name: str, city: str, category: str, chat_id: str, client_te
 
 
 def _amo_message(row_id: str, is_new: bool, name: str, city: str, category: str, chat_id: str, a: dict,
-                 client_text: str, manual_why: str, create: bool = False) -> None:
+                 client_text: str, manual_why: str, create: bool = False, near_ts: float | None = None) -> None:
     def run():
         if sheets.get_state(f"amo_skip_{row_id}", ""):
             return  # Роман попросил этого клиента в amoCRM не добавлять
         lead = _amo_lead(row_id)
         if not lead:  # сделку создаёт интеграция Avito ↔ amoCRM — находим её (может появиться не сразу)
             lead = amo_crm.find_lead(name, a.get("phone"), _amo_first_note(name, city, category, chat_id, client_text),
-                                     client_text=client_text, taken=_amo_taken(), create_city=city if create else None)
+                                     client_text=client_text, taken=_amo_taken(), create_city=city if create else None,
+                                     near_ts=near_ts or time.time())
             _amo_save_log()
             if not lead:
                 return
@@ -1751,7 +1752,14 @@ def amo_catch_up(user_id: int) -> None:
             continue
         made_before = amo_crm.stats["made"]
         _amo_message(row_id, True, c.get("Имя", ""), c.get("Город", ""), c.get("Категория", ""), chat, a,
-                     a.get("batch_text") or c.get("Сообщение клиента", ""), "", create=now - seen >= AMO_WAIT)
+                     a.get("batch_text") or c.get("Сообщение клиента", ""), "", create=now - seen >= AMO_WAIT,
+                     near_ts=seen.timestamp())
+        if (not _amo_lead(row_id) and now - seen >= AMO_WAIT and "вторую не создаю" in (amo_crm.match_log[-1:] or [""])[0]
+                and not sheets.get_state(f"amo_amb_{row_id}", "")):
+            sheets.set_state(f"amo_amb_{row_id}", _now())
+            tg.send_message(ADMIN_ID, f"📇 {c.get('Имя', '')} ({c.get('Город', '')}): в amoCRM несколько открытых сделок "
+                                      "с таким именем, не понял, какая этого клиента, — поля не заполнил и вторую не "
+                                      "создавал. Привяжите вручную или напишите мне, какая.")
         if _amo_lead(row_id) and amo_crm.stats["made"] > made_before:
             _amo_safe("переписка в сделку", _amo_history_note, row_id, _amo_lead(row_id), dialog, c.get("Имя", ""))
         booking = next((b for b in reversed(sheets.get_bookings()) if (b.get("chat_id") or "").strip() == chat), None)

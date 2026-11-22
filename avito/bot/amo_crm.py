@@ -145,7 +145,7 @@ def _log_match(text: str) -> None:
     del match_log[:-20]
 
 
-def _channel_lead(name: str, client_text: str, taken: set) -> tuple[int | None, str]:
+def _channel_lead(name: str, client_text: str, taken: set, near_ts: float | None = None) -> tuple[int | None, str]:
     """Штатный канал Avito в amoCRM (подключён у Романа) кладёт каждое обращение в «Неразобранное» воронки
     «Продажа курса». Чтобы не было двух сделок на одного клиента, сначала ищем его там (и принимаем на «Новая заявка»),
     потом — среди уже принятых за 3 дня открытых сделок с контактом с тем же именем."""
@@ -190,29 +190,39 @@ def _channel_lead(name: str, client_text: str, taken: set) -> tuple[int | None, 
             full = _get(f"leads/{lead['id']}")
             if (full.get("pipeline_id") == _pipe["id"] and full.get("status_id") not in (WON, LOST, _pipe["unsorted"])
                     and (full.get("created_at") or 0) >= week_ago):
-                found.append(full["id"])
+                found.append((full["id"], full.get("created_at") or 0))
+    if len(found) > 1 and near_ts:
+        # несколько клиентов с одним именем («Ольга»): интеграция заводит сделку в момент сообщения клиента
+        near = [f for f in found if abs(f[1] - near_ts) <= 900]
+        if len(near) == 1:
+            found = near
     if len(found) == 1:
-        _log_match(f"«{name}»: нашёл уже принятую сделку #{found[0]}")
-        return found[0], "уже принятая сделка"
+        _log_match(f"«{name}»: нашёл уже принятую сделку #{found[0][0]}")
+        return found[0][0], "уже принятая сделка"
     if found:
-        _log_match(f"«{name}»: открытых сделок с таким именем {len(found)} — не угадываю, создаю свою")
+        _log_match(f"«{name}»: открытых сделок с таким именем {len(found)} — не угадываю, вторую не создаю")
+        return None, "ambiguous"
     return None, ""
 
 
 def find_lead(name: str, phone: str | None, first_note: str, stage: str = "new",
-              client_text: str = "", taken: set = frozenset(), create_city: str | None = None) -> int | None:
+              client_text: str = "", taken: set = frozenset(), create_city: str | None = None,
+              near_ts: float | None = None) -> int | None:
     """Сделку создаёт интеграция Avito ↔ amoCRM (19.11/20.11 Роман: «не бот их создавал, а они шли с Avito»). Сначала
     ищем её: по телефону, в «Неразобранном» (принимаем), среди принятых сделок. Не нашли: create_city is None — None
     (поищем снова); иначе создаём сами — 21.11 Роман: «они всегда должны попадать в амо», а интеграция с 17.11
     не создала ни одной сделки."""
     lead_id, contact_id = _open_lead_by_phone(phone) if phone else (None, None)
+    how = ""
     if lead_id and lead_id not in taken:
         _log_match(f"«{name}»: нашёл открытую сделку #{lead_id} по телефону")
     else:
-        lead_id = _channel_lead(name, client_text, taken)[0]
+        lead_id, how = _channel_lead(name, client_text, taken, near_ts)
+        if how == "ambiguous":  # сделка интеграции, скорее всего, есть — просто не понять, какая; дубль не нужен
+            create_city = None
     if not lead_id and create_city is not None:
         return _create_lead(name, create_city, phone, contact_id, first_note, stage)
-    if not lead_id:
+    if not lead_id and how != "ambiguous":
         _log_match(f"«{name}»: сделки от интеграции Avito пока нет — жду её, через 15 минут создам сам")
         return None
     stats["created"] += 1  # в /status: «нашёл сделок»
