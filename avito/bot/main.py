@@ -230,7 +230,7 @@ def today_slots() -> str:
 
 def norm_when(value: str) -> str:
     """«19.11.2026 20.30» / «19.11.2026 9:00» → «19.11.2026 20:30» / «19.11.2026 09:00» (записи, внесённые руками)."""
-    m = re.match(r"^\s*(\d{1,2})\.(\d{1,2})\.(\d{4})\s+(\d{1,2})[:.](\d{2})\s*$", value or "")
+    m = re.match(r"^\s*(\d{1,2})\.(\d{1,2})\.(\d{4})\s+(\d{1,2})[:.,](\d{2})\s*$", value or "")
     if not m:
         return (value or "").strip()
     d, mo, y, h, mi = m.groups()
