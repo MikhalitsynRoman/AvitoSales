@@ -284,11 +284,15 @@ def schedule(exclude: frozenset = frozenset()) -> dict | None:
         return None
     now = datetime.now(MSK)
     booked = booked_set(exclude)
+    # запись не по сетке (Денис в 21:50, вписано руками) занимает и соседние окна: пробный — 30 минут
+    taken = [t for t in (_parse_msk(b) for b in booked) if t]
     result = {}
     for i in range(SCHEDULE_DAYS):
         d = (now + timedelta(days=i)).date()
         result[d] = [s for s in expand_slots(day_slots_text(d))
-                     if not is_past(d, s, now) and booking_key(d, s) not in booked]
+                     if not is_past(d, s, now) and booking_key(d, s) not in booked
+                     and not any(abs((datetime.strptime(booking_key(d, s), "%d.%m.%Y %H:%M").replace(tzinfo=MSK)
+                                      - t).total_seconds()) < 1800 for t in taken)]
     return result
 
 
@@ -1072,6 +1076,10 @@ def status_text() -> str:
         lines.append("Расписание не задано — пришлите часы на сегодня или неделю командой /week")
     else:
         now_d = datetime.now(MSK).date()
+        o = slots_override()
+        if o is not None:
+            lines.append(f"Расписание по датам до {json.loads(sheets.get_state('slots_only', '{}')).get('until', '')} "
+                         "(после — обычное недельное)")
         lines.append("Свободные окна (по 30 мин):")
         for d in sorted(sched)[:4]:
             times = sched[d]
