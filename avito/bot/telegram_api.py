@@ -82,6 +82,27 @@ def send_direct(chat_id: int, text: str, reply_markup: dict | None = None) -> di
     return _call("sendMessage", payload).get("result", {})
 
 
+def send_photo(chat_id: int, png: bytes, caption: str = "", reply_markup: dict | None = None) -> dict:
+    """Картинка (PNG) с подписью — только этому человеку, без копий команде."""
+    t = time.time()
+    stats["calls"] += 1
+    data = {"chat_id": chat_id, "caption": caption[:1024]}
+    if reply_markup:
+        data["reply_markup"] = json.dumps(reply_markup, ensure_ascii=False)
+    try:
+        resp = _session.post(f"{API}/sendPhoto", data=data, files={"photo": ("schedule.png", png, "image/png")},
+                             timeout=(CONNECT_TIMEOUT, 40))
+    except requests.RequestException as e:
+        stats["fails"] += 1
+        raise RuntimeError(f"нет связи с Telegram (sendPhoto): {clean_error(e)[:150]}") from None
+    finally:
+        stats["max_secs"] = max(stats["max_secs"], time.time() - t)
+    res = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {}
+    if not res.get("ok"):
+        raise RuntimeError(f"Telegram sendPhoto: {clean_error(resp.text)[:200]}")
+    return res.get("result", {})
+
+
 def send_message(chat_id: int, text: str, reply_markup: dict | None = None) -> dict:
     res = send_direct(chat_id, text, reply_markup)
     if chat_id == ADMIN_ID and res.get("message_id"):

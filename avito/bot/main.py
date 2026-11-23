@@ -15,6 +15,7 @@ import client as avito_client  # noqa: E402
 import sheets  # noqa: E402
 import telegram_api as tg  # noqa: E402
 import ai_reply  # noqa: E402
+import calendar_image  # noqa: E402
 import amo_crm  # noqa: E402
 from script_engine import (MONTHS, REFUSE_RE, TIME_RE, ZOOM_MARK, _client_time, _requested_date,  # noqa: E402
                            analyze_dialog, auto_decision, booking_key,
@@ -37,6 +38,7 @@ HELP_TEXT = (
     "я спрошу кнопками, кому его отправить.\n\n"
     "Команды:\n"
     "/status — работает ли бот, заявки и записи за сегодня, свободные окна\n"
+    "/schedule — неделя картинкой, как в Google Календаре: свободные окна и записанные пробные\n"
     "/auto on | /auto off — отвечать клиентам самому (в понятных ситуациях) или только через вас\n"
     "/ai on | /ai off — отвечать по смыслу через DeepSeek или только по правилам\n"
     "/amo on | /amo off — вести заявки сделками в amoCRM («Продажа курса») или нет\n"
@@ -54,6 +56,7 @@ MEMBER_HELP = (
     "• «❌ Исправить» — другие варианты ответа.\n"
     "• Свой текст — ответьте (reply) на карточку клиента.\n"
     "• /status — как сейчас работает бот.\n"
+    "• /schedule — свободные окна и записанные пробные на неделю картинкой.\n"
     "Роман видит, что вы отправили клиентам. Настройки и доступы меняет только он."
 )
 # команды, которые меняют настройки бота, — только для Романа
@@ -267,10 +270,19 @@ def week_slots() -> dict:
         return {}
 
 
+def _override_until():
+    try:
+        return datetime.strptime(json.loads(sheets.get_state("slots_only", "") or "{}").get("until", ""),
+                                 "%d.%m.%Y").date()
+    except (ValueError, TypeError, AttributeError):
+        return None
+
+
 def day_slots_text(d) -> str:
-    """Часы на день: на сегодня — то, что Роман прислал утром (если прислал), иначе — недельное расписание."""
+    """Часы на день: на сегодня — то, что Роман прислал утром (если прислал), иначе — недельное расписание.
+    Расписание по датам (slots_only) — только до своей даты until, дальше снова недельное."""
     o = slots_override()
-    if o is not None:
+    if o is not None and d <= (_override_until() or d):
         return o.get(d.strftime("%d.%m.%Y"), "")
     if d == datetime.now(MSK).date() and today_slots():
         return today_slots()
@@ -286,14 +298,64 @@ def schedule(exclude: frozenset = frozenset()) -> dict | None:
     booked = booked_set(exclude)
     # запись не по сетке (Денис в 21:50, вписано руками) занимает и соседние окна: пробный — 30 минут
     taken = [t for t in (_parse_msk(b) for b in booked) if t]
-    result = {}
-    for i in range(SCHEDULE_DAYS):
-        d = (now + timedelta(days=i)).date()
-        result[d] = [s for s in expand_slots(day_slots_text(d))
-                     if not is_past(d, s, now) and booking_key(d, s) not in booked
-                     and not any(abs((datetime.strptime(booking_key(d, s), "%d.%m.%Y %H:%M").replace(tzinfo=MSK)
-                                      - t).total_seconds()) < 1800 for t in taken)]
-    return result
+    return {d: _free_on(d, now, booked, taken)
+            for d in ((now + timedelta(days=i)).date() for i in range(SCHEDULE_DAYS))}
+
+
+def _free_on(d, now, booked: set, taken: list) -> list[str]:
+    return [s for s in expand_slots(day_slots_text(d))
+            if not is_past(d, s, now) and booking_key(d, s) not in booked
+            and not any(abs((datetime.strptime(booking_key(d, s), "%d.%m.%Y %H:%M").replace(tzinfo=MSK)
+                             - t).total_seconds()) < 1800 for t in taken)]
+
+
+# ---------- /schedule (23.11): неделя картинкой «как в Google Календаре» ----------
+
+def _schedule_week(offset: int = 0):
+    """Свободные окна и записанные пробные на неделю (пн–вс), offset — сколько недель вперёд."""
+    now = datetime.now(MSK)
+    monday = now.date() - timedelta(days=now.weekday()) + timedelta(weeks=offset)
+    days = [monday + timedelta(days=i) for i in range(7)]
+    booked = booked_set()
+    taken = [t for t in (_parse_msk(b) for b in booked) if t]
+    free = {d: _free_on(d, now, booked, taken) for d in days}
+    trials = {}
+    for b in sheets.get_bookings():
+        dt = _parse_msk(norm_when(b.get("Когда пробный урок", "")))
+        if dt and monday <= dt.date() <= days[-1]:
+            note = (b.get("Класс/цель") or "").strip().strip("—").strip()
+            trials.setdefault(dt.date(), []).append((dt, (b.get("Имя") or "").strip().strip("—").strip(), note))
+    return monday, now, free, trials
+
+
+def _schedule_caption(monday, free: dict, trials: dict) -> str:
+    lines = [f"🗓 Пробные · {calendar_image.week_title(monday)}"]
+    for i in range(7):
+        d = monday + timedelta(days=i)
+        blocks = calendar_image.free_blocks(free.get(d, []))
+        parts = [f"{calendar_image._hm(s)}–{calendar_image._hm(e)}" if e - s > 30 else calendar_image._hm(s)
+                 for s, e in blocks]
+        booked = ", ".join(f"{dt:%H:%M} {name}".strip() for dt, name, _ in sorted(trials.get(d, [])))
+        if parts or booked:
+            lines.append(f"{WEEKDAY_SHORT[d.weekday()].capitalize()} {d:%d.%m}: "
+                         + (", ".join(parts) if parts else "свободных нет")
+                         + (f" · 📌 {booked}" if booked else ""))
+    if len(lines) == 1:
+        lines.append("На этой неделе свободных окон нет.")
+    return "\n".join(lines)
+
+
+def send_schedule(chat_id: int, offset: int = 0) -> None:
+    monday, now, free, trials = _schedule_week(offset)
+    caption = _schedule_caption(monday, free, trials)
+    nav = [("◀ Пред. неделя", f"sch:{offset - 1}")] if offset > 0 else []
+    nav += [("След. неделя ▶", f"sch:{offset + 1}")] if offset < 4 else []
+    try:
+        png = calendar_image.render_week(monday, now, free, trials)
+        tg.send_photo(chat_id, png, caption, tg.inline_keyboard(nav) if nav else None)
+    except Exception as e:  # картинка не получилась — хотя бы текстом
+        _note_error("картинка расписания", e)
+        tg.send_direct(chat_id, caption, tg.inline_keyboard(nav) if nav else None)
 
 
 def free_slots_today(exclude: frozenset = frozenset()) -> list[str]:
@@ -859,6 +921,12 @@ def handle_callback(user_id: int, cq: dict) -> None:
         return
     action, _, rest = data.partition(":")
 
+    if action == "sch":  # листать неделю в /schedule — и Роману, и помощникам (только просмотр)
+        tg.answer_callback_query(cq["id"])
+        if chat_id == ADMIN_ID or chat_id in _team():
+            send_schedule(chat_id, max(0, min(4, int(rest or 0))))
+        return
+
     if chat_id == ADMIN_ID and action in ("team_ok", "team_no", "team_rm"):
         _team_callback(cq, action, rest, message_id)
         return
@@ -1161,6 +1229,10 @@ def handle_message(user_id: int, msg: dict) -> None:
 
     if text.startswith("/status"):
         tg.send_message(ADMIN_ID, status_text())
+        return
+
+    if text.split("@")[0] in ("/schedule", "/calendar", "/расписание"):
+        send_schedule(chat_id)
         return
 
     if text.startswith("/team"):
