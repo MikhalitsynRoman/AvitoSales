@@ -74,6 +74,7 @@ SYSTEM_PROMPT = """Ты — Роман, репетитор по профильн
 
 _usage = {"day": "", "calls": 0, "tokens_in": 0, "tokens_out": 0, "fails": 0}
 
+# (23.11 ключ добавлен Романом на хостинге)
 # api-docs.deepseek.com: POST /chat/completions, Authorization: Bearer; JSON-режим — response_format json_object,
 # в промпте должно быть слово «json» и пример формата (есть в SYSTEM_PROMPT); content иногда приходит пустым —
 # тогда один повтор. Размышления (thinking) выключены: ответ нужен быстро и строго в JSON.
