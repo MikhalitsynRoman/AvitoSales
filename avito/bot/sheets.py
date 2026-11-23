@@ -92,11 +92,13 @@ def _set_cell(sheet, row: int, col: int, value: str) -> None:
     sheet.update(values=[[value]], range_name=gspread.utils.rowcol_to_a1(row, col), value_input_option=RAW)
 
 
-def _append(sheet, values: list) -> int:
+def _append(sheet, values: list, key_in_a: bool = False) -> int:
     """Дописывает строку в первую пустую строку после последней заполненной и возвращает её номер.
     append_row от Google здесь не используем: 08.11 он раз за разом писал в строку 13 ПОВЕРХ существующей
     заявки (проверено на копии листа) — две заявки затирали друг друга, и бот слал карточку каждую минуту."""
-    row_num = len(sheet.col_values(1)) + 1  # в колонке A всегда что-то есть: дата или ключ
+    # не по колонке A: в строках, вписанных руками, она бывает пустой (23.11 так терялись записи на пробный).
+    # Лист «Состояние» большой, а ключ в A есть всегда, — для него быстрый способ.
+    row_num = (len(sheet.col_values(1)) if key_in_a else len(sheet.get_all_values())) + 1
     if row_num > sheet.row_count:
         sheet.add_rows(200)
     if any(c.strip() for c in sheet.row_values(row_num)):  # страховка: в занятую строку не пишем
@@ -399,5 +401,5 @@ def set_state(key: str, value: str) -> None:
         _set_cell(sheet, found[0], 2, value)
         found[1] = value
         return
-    row_num = _append(_state_sheet(), [key, value]) or (max((v[0] for v in state.values()), default=1) + 1)
+    row_num = _append(_state_sheet(), [key, value], key_in_a=True) or (max((v[0] for v in state.values()), default=1) + 1)
     state[key] = [row_num, value]

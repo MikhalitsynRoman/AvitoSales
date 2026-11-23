@@ -1,4 +1,5 @@
 import difflib
+import hashlib
 import json
 import os
 import re
@@ -238,9 +239,20 @@ def norm_when(value: str) -> str:
     return f"{int(d):02d}.{int(mo):02d}.{y} {int(h):02d}:{mi}"
 
 
-def booked_set() -> set:
-    """Занятые окна «дд.мм.гггг ЧЧ:ММ» из листа «Записаны на пробный»."""
-    return {norm_when(b.get("Когда пробный урок", "")) for b in sheets.get_bookings()}
+def booked_set(exclude: frozenset = frozenset()) -> set:
+    """Занятые окна «дд.мм.гггг ЧЧ:ММ» из листа «Записаны на пробный» (без exclude — записей самого клиента)."""
+    return {norm_when(b.get("Когда пробный урок", "")) for b in sheets.get_bookings()} - set(exclude)
+
+
+def _own_keys(chat_id: str, name: str) -> frozenset:
+    """Окна, на которые записан сам этот клиент: по chat_id, а в строках, вписанных руками без chat_id, — по имени.
+    23.11 Анастасия подтвердила время, о котором договорились по телефону («Да, всё верно»), а бот ответил
+    «уже занято» — занято было ею же — и перезаписал её на другое время."""
+    first = (name or "").strip().lower().split()[:1]
+    return frozenset(norm_when(b.get("Когда пробный урок", "")) for b in sheets.get_bookings()
+                     if (b.get("chat_id") or "").strip() == chat_id
+                     or ((b.get("chat_id") or "").strip() in ("", "—") and first
+                         and (b.get("Имя") or "").strip().lower().split()[:1] == first))
 
 
 WEEKDAY_SHORT = ["пн", "вт", "ср", "чт", "пт", "сб", "вс"]
@@ -265,13 +277,13 @@ def day_slots_text(d) -> str:
     return week_slots().get(d.weekday(), "")
 
 
-def schedule() -> dict | None:
+def schedule(exclude: frozenset = frozenset()) -> dict | None:
     """Свободные окна по 30 минут на ближайшие дни {дата: [...]}: без занятых и прошедших (+15 мин на ответ).
     None — расписания нет совсем (ни недельного, ни на сегодня): тогда бот спрашивает клиента, когда удобно."""
     if not week_slots() and not today_slots():
         return None
     now = datetime.now(MSK)
-    booked = booked_set()
+    booked = booked_set(exclude)
     result = {}
     for i in range(SCHEDULE_DAYS):
         d = (now + timedelta(days=i)).date()
@@ -280,14 +292,14 @@ def schedule() -> dict | None:
     return result
 
 
-def free_slots_today() -> list[str]:
-    return (schedule() or {}).get(datetime.now(MSK).date(), [])
+def free_slots_today(exclude: frozenset = frozenset()) -> list[str]:
+    return (schedule(exclude) or {}).get(datetime.now(MSK).date(), [])
 
 
-def _build_variants(name: str, client_text: str, a: dict) -> list[str]:
-    return generate_variants(name, client_text, ", ".join(free_slots_today()), a, booked_set(),
+def _build_variants(name: str, client_text: str, a: dict, own: frozenset = frozenset()) -> list[str]:
+    return generate_variants(name, client_text, ", ".join(free_slots_today(own)), a, booked_set(own),
                              sheets.get_state("price_hint", ""), sheets.get_state("zoom_link", ""),
-                             schedule=schedule())
+                             schedule=schedule(own))
 
 
 def parse_week(text: str) -> dict:
@@ -324,18 +336,80 @@ def week_text(week: dict) -> str:
     return "\n".join(f"{WEEKDAY_SHORT[d]}: {week[d]}" for d in sorted(week)) or "не задано"
 
 
-def _save_meta(row_id: str, a: dict) -> None:
+def _save_meta(row_id: str, a: dict, own: frozenset = frozenset()) -> None:
     """Что пригодится при отправке: о каком времени договорились (для записи на пробный) и телефон."""
     book = ""
     if a.get("confirmed"):
         d, hhmm = a["confirmed"]
         key = booking_key(d or datetime.now(MSK).date(), hhmm)
-        book = "" if key in booked_set() else key
+        book = "" if key in booked_set(own) else key
     sheets.set_state(f"meta_{row_id}", json.dumps({"book": book, "phone": a.get("phone") or ""}, ensure_ascii=False))
 
 
 def _note_error(where: str, err) -> None:
     _stats["errors"] = (_stats["errors"] + [f"{_hhmm()} {where}: {tg.clean_error(err)[:200]}"])[-5:]
+
+
+# ---------- кто пишет клиенту: бот или человек (23.11, Роман) ----------
+# «Если есть уже не твой ответ — эту заявку не трогаешь»: Светлана (менеджер) и Роман иногда отвечают клиенту
+# прямо в Avito, а бот потом отвечал ещё раз, и клиент путался. Avito не различает, кто писал (автор у всех
+# сообщений — аккаунт Романа), поэтому бот запоминает номер каждого своего сообщения (state bs_{чат}). Исходящее
+# сообщение, которого бот не отправлял, — значит, пишет человек: чат попадает в human_chats навсегда, и бот в нём
+# больше сам не отвечает и не напоминает (карточки Роману приходят как раньше, кнопки работают — это решение Романа).
+# Сообщения до запуска этой проверки (bot_sent_since) разобраны один раз вручную и тоже лежат в human_chats.
+
+def _text_hash(text: str) -> str:
+    return hashlib.md5(re.sub(r"\s+", " ", text or "").strip().lower().encode("utf-8")).hexdigest()[:12]
+
+
+def _avito_send(user_id: int, chat_id: str, text: str) -> dict:
+    """Все сообщения бота клиентам — только здесь: так бот знает, какие сообщения в чате его."""
+    res = avito_client.send_message(user_id, chat_id, text) or {}
+    key = f"bs_{chat_id[:24]}"
+    try:
+        mine = json.loads(sheets.get_state(key, "") or "[]")
+    except ValueError:
+        mine = []
+    mine = [x for x in mine if time.time() - x[1] < 30 * 86400][-40:]
+    mine.append([res.get("id", "") if isinstance(res, dict) else "", time.time(), _text_hash(text)])
+    sheets.set_state(key, json.dumps(mine))
+    return res
+
+
+def _human_chats() -> dict:
+    try:
+        return json.loads(sheets.get_state("human_chats", "") or "{}")
+    except ValueError:
+        return {}
+
+
+def _human_text(chat_id: str, dialog: list[dict]) -> str:
+    """Писал ли клиенту в этом чате человек (не бот). Возвращает, что и когда, или ""."""
+    human = _human_chats()
+    if chat_id in human:
+        return human[chat_id]
+    try:
+        since = float(sheets.get_state("bot_sent_since", "") or 0)
+    except ValueError:
+        since = 0
+    if not since:
+        return ""
+    try:
+        mine = json.loads(sheets.get_state(f"bs_{chat_id[:24]}", "") or "[]")
+    except ValueError:
+        mine = []
+    ids, hashes = {x[0] for x in mine if x[0]}, {x[2] for x in mine}
+    for m in dialog:
+        if (m["direction"] == "out" and not m.get("system") and m["text"].strip() and m["created"] >= since
+                and m.get("id") not in ids and _text_hash(m["text"]) not in hashes):
+            reason = f"{datetime.fromtimestamp(m['created'], MSK):%d.%m %H:%M} «{m['text'].strip()[:80]}»"
+            human[chat_id] = reason
+            sheets.set_state("human_chats", json.dumps(human, ensure_ascii=False))
+            return reason
+    return ""
+
+
+HUMAN_WHY = "в этом чате клиенту уже отвечали вы или Светлана — бот сам не пишет, переписку ведёте вы"
 
 
 # ---------- карточки ----------
@@ -351,7 +425,8 @@ def _load_dialog(user_id: int, chat_id: str) -> list[dict]:
         _note_error("переписка Avito", e)
         return []
     return [{"direction": m.get("direction"), "text": (m.get("content") or {}).get("text") or "",
-             "created": m.get("created", 0), "system": m.get("type") == "system"} for m in reversed(raw)]
+             "created": m.get("created", 0), "system": m.get("type") == "system", "id": m.get("id", "")}
+            for m in reversed(raw)]
 
 
 def _history_lines(dialog: list[dict], name: str) -> str:
@@ -478,7 +553,7 @@ def _send_to_client(user_id: int, row_id: str, text: str, status: str) -> bool:
         tg.send_message(ADMIN_ID, f"Клиенту {v['Имя']} уже отправлено раньше — второй раз не отправляю.")
         return False
     try:
-        avito_client.send_message(user_id, v["chat_id"], text)
+        _avito_send(user_id, v["chat_id"], text)
     except Exception as e:
         _note_error("отправка в Avito", e)
         sheets.update_contact_status(row_id, f"ошибка: {str(e)[:100]}")
@@ -512,14 +587,25 @@ def _log_trial_booking(row_id: str, v: dict) -> None:
     except ValueError:
         meta = {}
     when = meta.get("book") or "время не определил — уточните в таблице"
-    sheets.log_booking(v["Имя"], meta.get("phone") or "—", v["chat_id"], when, v["Категория"])
+    if when in _own_keys(v["chat_id"], v["Имя"]):
+        row_note = "Эта запись уже есть в листе «Записаны на пробный» — вторую строку не добавлял."
+    else:
+        try:
+            sheets.log_booking(v["Имя"], meta.get("phone") or "—", v["chat_id"], when, v["Категория"])
+            row_note = "Строка добавлена в лист «Записаны на пробный»."
+        except Exception as e:
+            _note_error("запись в лист «Записаны на пробный»", e)
+            tg.send_message(ADMIN_ID, f"❌ Записал {v['Имя']} ({v['Город']}) на {when}, но НЕ смог внести строку в лист "
+                                      f"«Записаны на пробный»: {tg.clean_error(e)[:150]}\nВнесите её вручную — иначе "
+                                      "не будет напоминаний и окно останется свободным.")
+            row_note = ""
     meta["book"] = ""
     sheets.set_state(f"meta_{row_id}", json.dumps(meta, ensure_ascii=False))
 
     _amo_safe("запись на пробный", _amo_set_booked, row_id, v, meta.get("phone"), when, "Ссылка Zoom отправлена.")
     tg.send_message(ADMIN_ID, f"📅 Записал на пробный: {v['Имя']} ({v['Город']}) — {when}"
                               + (f", тел. {meta['phone']}" if meta.get("phone") else "")
-                              + "\nСтрока добавлена в лист «Записаны на пробный».")
+                              + (f"\n{row_note}" if row_note else ""))
 
 
 def _amo_set_booked(row_id: str, v: dict, phone: str | None, when: str, how: str) -> int:
@@ -666,7 +752,7 @@ def _book_do(user_id: int, row_id: str, v: dict, dt: datetime, send: bool, messa
     if send:
         text = _book_client_text(dt)
         try:
-            avito_client.send_message(user_id, v["chat_id"], text)
+            _avito_send(user_id, v["chat_id"], text)
         except Exception as e:
             _note_error("запись: отправка в Avito", e)
             tg.edit_message_text(ADMIN_ID, message_id, f"❌ Не отправил {v['Имя']} подтверждение: {str(e)[:150]}\n"
@@ -683,7 +769,16 @@ def _book_do(user_id: int, row_id: str, v: dict, dt: datetime, send: bool, messa
         lead = _amo_lead(row_id)
         if lead:
             _amo_safe("ответ клиенту", amo_crm.note, lead, f"Ответ из Telegram в Avito:\n{text}")
-    sheets.log_booking(v["Имя"], phone or "—", v["chat_id"], when, v["Категория"])
+    try:
+        sheets.log_booking(v["Имя"], phone or "—", v["chat_id"], when, v["Категория"])
+    except Exception as e:
+        _note_error("запись в лист «Записаны на пробный»", e)
+        tg.edit_message_text(ADMIN_ID, message_id, f"❌ Не смог внести {v['Имя']} на {when} в лист «Записаны на "
+                                                   f"пробный»: {tg.clean_error(e)[:150]}\n"
+                                                   + ("Подтверждение клиенту уже ушло — внесите строку вручную."
+                                                      if send else "Нажмите ещё раз через минуту."),
+                             {"inline_keyboard": []} if send else _book_confirm_screen(row_id, v, dt)[1])
+        return
     lead = _amo_safe("запись на пробный", _amo_set_booked, row_id, v, phone or None, when,
                      "Записан кнопкой в Telegram." + (" Ссылка Zoom отправлена." if send else ""))
     soon = dt - now <= timedelta(minutes=30)
@@ -893,9 +988,10 @@ def handle_callback(user_id: int, cq: dict) -> None:
         dialog = _load_dialog(user_id, v["chat_id"])
         if dialog:
             a = analyze_dialog(dialog)
-            variants = _build_variants(v["Имя"], a["batch_text"] or v["Сообщение клиента"], a)
+            own = _own_keys(v["chat_id"], v["Имя"])
+            variants = _build_variants(v["Имя"], a["batch_text"] or v["Сообщение клиента"], a, own)
             if _ai_enabled() and not _hard_manual_reason(a):
-                ai = ai_reply.ai_reply(v["Имя"], dialog, a, schedule(), sheets.get_state("price_hint", ""), variants[0])
+                ai = ai_reply.ai_reply(v["Имя"], dialog, a, schedule(own), sheets.get_state("price_hint", ""), variants[0])
                 if ai and ai["action"] == "reply":
                     variants = [ai["text"]] + [x for x in variants if x != ai["text"]][:2]
                 elif ai and ai["action"] == "book":
@@ -904,7 +1000,7 @@ def handle_callback(user_id: int, cq: dict) -> None:
                                 f"{day_label(ai['date_obj'], datetime.now(MSK).date())} в {ai['time']} мск!"] + variants[:2]
             sheets.set_state(f"var_{row_id}", json.dumps(variants, ensure_ascii=False))
             sheets.set_state(f"vardate_{row_id}", today_str())
-            _save_meta(row_id, a)
+            _save_meta(row_id, a, own)
         else:
             variants = _variants_for(row_id, v)
         text, markup = _variant_screen(row_id, v["Имя"], variants, 0)
@@ -1606,7 +1702,14 @@ def avito_link_bookings(user_id: int) -> None:
                 for b in books):
             sheets.set_state(key, f"не добавлял: {when}")
             continue
-        sheets.log_booking(v["Имя"], "—", cid, when, v.get("Категория", ""))
+        try:
+            sheets.log_booking(v["Имя"], "—", cid, when, v.get("Категория", ""))
+        except Exception as e:
+            _note_error("запись в лист «Записаны на пробный»", e)
+            tg.send_message(ADMIN_ID, f"❌ Вижу запись {v['Имя']} ({v['Город']}) на {when} в Avito, но НЕ смог внести её "
+                                      f"в лист «Записаны на пробный»: {tg.clean_error(e)[:150]}. Внесите вручную.")
+            sheets.set_state(key, f"ошибка записи: {when}")
+            continue
         sheets.set_state(key, f"добавил {when}")
         _amo_safe("запись в Avito", _amo_set_booked, v["id"], v, None, when, "Ссылка Zoom отправлена в Avito.")
         late = dt - now < timedelta(minutes=10)
@@ -1650,9 +1753,17 @@ def _trial_reminders(user_id: int) -> None:
                                           f"«{cancel[:200]}». Проверьте, в силе ли пробный, — если перенесли, "
                                           "поменяйте время в листе «Записаны на пробный».")
                 continue
+            human = _human_text(chat, _load_dialog(user_id, chat))
+            if human:
+                for k2 in (k for k, *_ in REMINDERS):  # ни одного напоминания по этой записи, сообщение Роману одно
+                    _reminded.add(f"rem{k2}_{chat}_{dt:%d%m%H%M}")
+                    sheets.set_state(f"rem{k2}_{chat}_{dt:%d%m%H%M}", f"не отправлено (пишет человек): {_now()}")
+                tg.send_message(ADMIN_ID, f"⏸ Не напоминаю {name} о пробном {dt:%d.%m в %H:%M}: в этом чате клиенту "
+                                          f"писали вы или Светлана ({human}). Напомните сами, если нужно.")
+                continue
             text = _reminder_text(kind, name, dt, now)
             try:
-                avito_client.send_message(user_id, chat, text)
+                _avito_send(user_id, chat, text)
             except Exception as e:
                 _reminded.discard(key)  # не ушло — попробуем при следующей проверке, пока окно не прошло
                 _note_error("напоминание о пробном", e)
@@ -1763,6 +1874,11 @@ def _send_auto(user_id: int, row_id: str, item: dict) -> None:
         return
     if _stale_reason(item["text"], {**v, "Дата": today_str()}, row_id):
         tg.send_message(ADMIN_ID, f"⏸ Не отправил автоответ {v['Имя']}: время в нём устарело. Нажмите «❌ Исправить».")
+        return
+    if _human_text(item["chat_id"], _load_dialog(user_id, item["chat_id"])):
+        if item.get("card"):
+            tg.edit_message_reply_markup(ADMIN_ID, int(item["card"]), tg.keyboard_rows(
+                [[("⏸ Автоответ не отправлен: в чате пишет человек", "noop")]] + _card_buttons(row_id)["inline_keyboard"]))
         return
     ok, why = _auto_limits_ok(item["chat_id"], {}, None)
     if not ok:
@@ -2192,7 +2308,8 @@ def _notify_client(user_id: int, chat_id: str, name: str, city: str, avito_msg_i
     a = analyze_dialog(dialog)
     client_text = a["batch_text"] or last_text
     category = category_text(a)
-    variants = _build_variants(name, client_text, a)
+    own = _own_keys(chat_id, name)
+    variants = _build_variants(name, client_text, a, own)
     draft = variants[0]
 
     # один клиент — одна строка: если он уже писал, обновляем его строку, а старую карточку гасим
@@ -2200,9 +2317,10 @@ def _notify_client(user_id: int, chat_id: str, name: str, city: str, avito_msg_i
     row_id = existing["values"]["id"] if existing and existing["values"]["id"] else sheets.new_row_id()
     # 🧠 DeepSeek отвечает по смыслу всей переписки; правила — страховка и запасной вариант, если модель
     # недоступна или её ответ не прошёл проверку (ai_reply.validate)
-    ai, ai_tag, hard = None, "", _hard_manual_reason(a)
+    human = _human_text(chat_id, dialog)
+    ai, ai_tag, hard = None, "", _hard_manual_reason(a) or (HUMAN_WHY if human else "")
     if allow_auto and _ai_enabled() and not hard:
-        ai = ai_reply.ai_reply(name, dialog, a, schedule(), sheets.get_state("price_hint", ""), variants[0])
+        ai = ai_reply.ai_reply(name, dialog, a, schedule(own), sheets.get_state("price_hint", ""), variants[0])
         err = ai_reply.usage().get("last_error", "")
         if not ai and ("402" in err or "401" in err) and sheets.get_state("ai_alert_day", "") != today_str():
             sheets.set_state("ai_alert_day", today_str())  # не чаще раза в день
@@ -2225,12 +2343,14 @@ def _notify_client(user_id: int, chat_id: str, name: str, city: str, avito_msg_i
     # отвечать ли самому: только в распознанных ситуациях, при включённом автоответе и в пределах лимитов
     auto_ok, why = (False, "")
     if allow_auto and _auto_enabled():
-        if ai and ai["action"] == "manual":
+        if human:
+            auto_ok, why = False, f"{HUMAN_WHY} ({human})"
+        elif ai and ai["action"] == "manual":
             auto_ok, why = False, "DeepSeek считает, что лучше ответить вам: " + (ai.get("reason") or "нестандартный вопрос")
         elif ai:
             auto_ok, why = True, ""
         else:
-            auto_ok, why = auto_decision(a, ", ".join(free_slots_today()), schedule())
+            auto_ok, why = auto_decision(a, ", ".join(free_slots_today(own)), schedule(own))
         if auto_ok:
             auto_ok, why = _auto_limits_ok(chat_id, a, existing)
     auto_title = (f" — отвечу сам через {AUTO_DELAY // 60} мин" if AUTO_DELAY else " — отвечаю сам")
@@ -2258,7 +2378,7 @@ def _notify_client(user_id: int, chat_id: str, name: str, city: str, avito_msg_i
     sheets.set_state(f"var_{row_id}", json.dumps(variants, ensure_ascii=False))
     sheets.set_state(f"card_{sent.get('message_id')}", row_id)
     sheets.set_state(f"vardate_{row_id}", today_str())
-    _save_meta(row_id, a)
+    _save_meta(row_id, a, own)
     # amoCRM — до автоответа, чтобы ответ бота тоже лёг в сделку примечанием
     _amo_message(row_id, not (existing and existing["values"]["id"]), name, city, category, chat_id, a, client_text,
                  why if (allow_auto and _auto_enabled() and not auto_ok) else "")
@@ -2402,6 +2522,8 @@ def main() -> None:
     _stats["host"] = "хостинг reg.ru" if "reg.ru" in host else host
     _stats["started"] = _now()
     sheets.set_state("last_start", f"{_now()} ({host})")
+    if not sheets.get_state("bot_sent_since", ""):
+        sheets.set_state("bot_sent_since", str(int(time.time())))
     sheets.set_state("sheets_diag", f"{_now()}: повторы при сбоях Google: "
                      + (", ".join(sheets.RETRY_PATCHED) or "НЕ ВКЛЮЧЕНЫ"))
     # 06.11 бот упал при запуске на коротком обрыве связи с Avito — даём ему три попытки, а не одну
