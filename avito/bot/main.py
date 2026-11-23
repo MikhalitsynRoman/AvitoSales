@@ -2366,6 +2366,8 @@ def _notify_client(user_id: int, chat_id: str, name: str, city: str, avito_msg_i
                            else ai_tag + title)
     if allow_auto and _auto_enabled() and not auto_ok and why:
         card_text += f"\n\n✋ Нужен ваш ответ: {why}"
+    if ai and ai.get("think"):  # Роману видно, как модель поняла переписку и почему ответила так
+        card_text += f"\n\n🧠 Как понял переписку: {ai['think']}"
     # без задержки отменять нечего — кнопки обычные (останутся, только если отправка вдруг не удалась)
     buttons = _auto_buttons(row_id) if auto_ok and AUTO_DELAY else _card_buttons(row_id)
     sent = tg.send_message(ADMIN_ID, card_text, reply_markup=buttons)
