@@ -16,6 +16,7 @@ import sheets  # noqa: E402
 import telegram_api as tg  # noqa: E402
 import ai_reply  # noqa: E402
 import calendar_image  # noqa: E402
+import gcal  # noqa: E402
 import amo_crm  # noqa: E402
 from script_engine import (MONTHS, REFUSE_RE, TIME_RE, ZOOM_MARK, _client_time, _requested_date,  # noqa: E402
                            analyze_dialog, auto_decision, booking_key,
@@ -39,6 +40,7 @@ HELP_TEXT = (
     "Команды:\n"
     "/status — работает ли бот, заявки и записи за сегодня, свободные окна\n"
     "/schedule — неделя картинкой, как в Google Календаре: свободные окна и записанные пробные\n"
+    "/gcal — пробные из таблицы сами появляются в вашем Google Календаре (/gcal ID_календаря — подключить)\n"
     "/auto on | /auto off — отвечать клиентам самому (в понятных ситуациях) или только через вас\n"
     "/ai on | /ai off — отвечать по смыслу через DeepSeek или только по правилам\n"
     "/amo on | /amo off — вести заявки сделками в amoCRM («Продажа курса») или нет\n"
@@ -60,7 +62,7 @@ MEMBER_HELP = (
     "Роман видит, что вы отправили клиентам. Настройки и доступы меняет только он."
 )
 # команды, которые меняют настройки бота, — только для Романа
-OWNER_ONLY = ("/auto", "/ai", "/amo", "/week", "/zoom", "/price", "/team")
+OWNER_ONLY = ("/auto", "/ai", "/amo", "/week", "/zoom", "/price", "/team", "/gcal")
 
 # Статистика процесса для /status (в памяти, сбрасывается при перезапуске)
 _stats = {"started": "", "host": "", "last_check": 0.0, "check_secs": 0.0, "avito_fails": 0, "errors": []}
@@ -307,6 +309,130 @@ def _free_on(d, now, booked: set, taken: list) -> list[str]:
             if not is_past(d, s, now) and booking_key(d, s) not in booked
             and not any(abs((datetime.strptime(booking_key(d, s), "%d.%m.%Y %H:%M").replace(tzinfo=MSK)
                              - t).total_seconds()) < 1800 for t in taken)]
+
+
+# ---------- Google Календарь (24.11, Роман): записи на пробный → события в его календаре ----------
+# Ключ события — «дд.мм.гггг ЧЧ:ММ|имя». Новая строка в листе → событие; строку удалили или перенесли время → событие
+# бота убираем (только своё, из gcal_map; чужие события календаря бот не трогает). Прошедшие записи не создаём.
+# Страховка: если лист вдруг пришёл пустым или пропало сразу много записей — ничего не удаляем, пишем Роману.
+
+_gcal_retry_at = [0.0]
+GCAL_MAX_DELETE = 3
+
+
+def _gcal_map() -> dict:
+    try:
+        return json.loads(sheets.get_state("gcal_map", "") or "{}")
+    except ValueError:
+        return {}
+
+
+def _gcal_desc(b: dict) -> str:
+    lines = ["Бесплатный пробный урок, 30 минут, онлайн в Zoom."]
+    note = (b.get("Класс/цель") or "").strip()
+    phone = (b.get("Телефон") or "").strip()
+    chat = (b.get("chat_id") or "").strip()
+    if note and note != "—":
+        lines.append(f"Класс/цель: {note}")
+    if phone and phone != "—":
+        lines.append(f"Телефон: {phone}")
+    if chat.startswith("u2i-"):
+        lines.append(f"Чат Avito: {AVITO_CHAT_URL.format(chat)}")
+    zoom = sheets.get_state("zoom_link", "")
+    if zoom:
+        lines.append(f"Zoom: {zoom}")
+    lines.append("\nСоздано ботом из листа «Записаны на пробный». Перенести или отменить — в таблице: событие "
+                 "обновится само.")
+    return "\n".join(lines)
+
+
+def gcal_sync(report: bool = True) -> tuple[list, list]:
+    cal = sheets.get_state("gcal_id", "")
+    if not cal or time.time() < _gcal_retry_at[0]:
+        return [], []
+    now = datetime.now(MSK)
+    current = {}
+    for b in sheets.get_bookings():
+        when = norm_when(b.get("Когда пробный урок", ""))
+        dt = _parse_msk(when)
+        name = (b.get("Имя") or "").strip().strip("—").strip()
+        if not dt or not now - timedelta(hours=12) <= dt <= now + timedelta(days=120):
+            continue
+        current[f"{when}|{name.lower()}"] = (dt, name, b)
+    mp = _gcal_map()
+    created, removed = [], []
+    try:
+        for key, (dt, name, b) in sorted(current.items(), key=lambda x: x[1][0]):
+            if key in mp or dt < now:
+                continue
+            note = (b.get("Класс/цель") or "").strip().strip("—").strip()
+            title = f"Пробный: {name or 'клиент'}" + (f" ({note})" if note else "")
+            mp[key] = {"id": gcal.create_event(cal, dt, title, _gcal_desc(b)), "when": f"{dt:%d.%m.%Y %H:%M}",
+                       "name": name}
+            sheets.set_state("gcal_map", json.dumps(mp, ensure_ascii=False))
+            created.append(f"• {dt:%d.%m %H:%M} {name}")
+        gone = [(k, v) for k, v in mp.items() if k not in current and (_parse_msk(v["when"]) or now) > now]
+        if gone and (not current or len(gone) > GCAL_MAX_DELETE):
+            if sheets.get_state("gcal_warn", "") != str(sorted(k for k, _ in gone)):
+                sheets.set_state("gcal_warn", str(sorted(k for k, _ in gone)))
+                tg.send_message(ADMIN_ID, "📆 Из таблицы пропали сразу несколько записей на пробный ("
+                                + ", ".join(f"{v['when'][:5]} {v['when'][11:]} {v.get('name', '')}" for _, v in gone)
+                                + ") — похоже на сбой чтения листа. На всякий случай события в Google Календаре "
+                                  "не удаляю — уберите их сами, если записи правда отменены.")
+        else:
+            for k, v in gone:
+                gcal.delete_event(cal, v["id"])
+                mp.pop(k)
+                sheets.set_state("gcal_map", json.dumps(mp, ensure_ascii=False))
+                removed.append(f"• {v['when'][:5]} {v['when'][11:]} {v.get('name', '')}")
+        old = [k for k, v in mp.items() if (_parse_msk(v["when"]) or now) < now - timedelta(days=30)]
+        if old:
+            for k in old:
+                mp.pop(k)
+            sheets.set_state("gcal_map", json.dumps(mp, ensure_ascii=False))
+    except Exception as e:
+        _gcal_retry_at[0] = time.time() + 600  # не долбим API каждую минуту
+        _note_error("Google Календарь", e)
+        if sheets.get_state("gcal_alert_day", "") != today_str():
+            sheets.set_state("gcal_alert_day", today_str())
+            tg.send_message(ADMIN_ID, f"⚠️ Не получилось обновить Google Календарь: {str(e)[:300]}")
+    if report and (created or removed):
+        tg.send_message(ADMIN_ID, "📆 Google Календарь:"
+                        + (("\nДобавил пробные:\n" + "\n".join(created)) if created else "")
+                        + (("\nУбрал (записи нет в таблице):\n" + "\n".join(removed)) if removed else ""))
+    return created, removed
+
+
+def _gcal_command(arg: str) -> None:
+    email = gcal.service_email()
+    if arg.lower() == "off":
+        sheets.set_state("gcal_id", "")
+        tg.send_message(ADMIN_ID, "📆 Больше не добавляю пробные в Google Календарь. Уже созданные события остались.")
+        return
+    if not arg:
+        cal = sheets.get_state("gcal_id", "")
+        tg.send_message(ADMIN_ID, (f"📆 Пробные добавляю в календарь {cal}." if cal else "📆 Google Календарь не подключён.")
+                        + "\n\nКак подключить:\n1. В Google Календаре: настройки нужного календаря → «Открыть доступ» → "
+                          f"добавить {email} с правом «Вносить изменения в мероприятия».\n"
+                          "2. Там же, «Интеграция календаря» → скопировать «Идентификатор календаря» "
+                          "(у основного календаря это ваш адрес Gmail).\n3. Прислать сюда: /gcal идентификатор\n\n"
+                          "/gcal off — перестать добавлять.")
+        return
+    cal = arg.split()[0]
+    try:
+        title = gcal.check_access(cal)
+    except Exception as e:
+        tg.send_message(ADMIN_ID, f"📆 Не получилось подключить календарь {cal}: {str(e)[:300]}\n\n"
+                                  f"Проверьте, что календарь открыт для {email} с правом «Вносить изменения в мероприятия».")
+        return
+    sheets.set_state("gcal_id", cal)
+    _gcal_retry_at[0] = 0
+    created, _ = gcal_sync(report=False)
+    tg.send_message(ADMIN_ID, f"📆 Подключил календарь «{title}». Теперь каждая запись на пробный из таблицы сама "
+                              "появляется в нём (30 минут, с классом, чатом Avito и ссылкой Zoom); перенесли или удалили "
+                              "строку — событие обновится."
+                    + (("\n\nДобавил будущие пробные:\n" + "\n".join(created)) if created else
+                       "\n\nБудущих пробных в таблице сейчас нет."))
 
 
 # ---------- /schedule (23.11): неделя картинкой «как в Google Календаре» ----------
@@ -1126,6 +1252,9 @@ def status_text() -> str:
     else:
         lines.append(f"🧠 DeepSeek: {'включён' if _ai_enabled() else 'выключен (/ai on)'} · сегодня запросов {u['calls']}, "
                      f"не удалось {u['fails']}, токенов {u['tokens_in']}+{u['tokens_out']}")
+    cal = sheets.get_state("gcal_id", "")
+    lines.append(f"📆 Google Календарь: {'пробные добавляю в ' + cal if cal else 'не подключён (/gcal)'}"
+                 + (f" · событий бота: {len(_gcal_map())}" if cal else ""))
     s = amo_crm.stats
     if not amo_crm.available():
         lines.append("📇 amoCRM: не подключён (нет AMO_DOMAIN / AMO_TOKEN)")
@@ -1233,6 +1362,10 @@ def handle_message(user_id: int, msg: dict) -> None:
 
     if text.split("@")[0] in ("/schedule", "/calendar", "/расписание"):
         send_schedule(chat_id)
+        return
+
+    if text.startswith("/gcal"):
+        _gcal_command(text[len("/gcal"):].strip())
         return
 
     if text.startswith("/team"):
@@ -2537,6 +2670,7 @@ def _run_avito_check(user_id: int) -> None:
             _trial_reminders(user_id)
         except Exception as e:
             _note_error("напоминания о пробном", e)
+        gcal_sync()
         try:
             amo_sync_bookings_once()
             amo_fields_once(user_id)
