@@ -205,9 +205,26 @@ def _channel_lead(name: str, client_text: str, taken: set, near_ts: float | None
     return None, ""
 
 
+# Сделки интеграции Avito называются по объявлению — «Репетитор по математике ЕГЭ ОГЭ», и в списке их не различить.
+# 23.11, Роман: переименовывать в «Имя — Avito (город)», как сделки бота. Название, которое дал сам Роман, не трогаем.
+DEFAULT_NAME_RE = re.compile(r"^\s*(репетитор\s+по\s+математике.*|сделка\s*#\s*\d+|)\s*$", re.I)
+
+
+def rename_default(lead_id: int, name: str, city: str) -> str:
+    if not name or name == "—":
+        return ""
+    cur = _get(f"leads/{lead_id}").get("name") or ""
+    title = (f"{name} — Avito" + (f" ({city})" if city and city != "—" else ""))[:250]
+    if cur == title or not DEFAULT_NAME_RE.match(cur):
+        return ""
+    _req("PATCH", f"leads/{lead_id}", body={"name": title})
+    _log_match(f"«{name}»: сделку #{lead_id} назвал «{title}» (было «{cur}»)")
+    return "переименовал"
+
+
 def find_lead(name: str, phone: str | None, first_note: str, stage: str = "new",
               client_text: str = "", taken: set = frozenset(), create_city: str | None = None,
-              near_ts: float | None = None) -> int | None:
+              near_ts: float | None = None, city: str = "") -> int | None:
     """Сделку создаёт интеграция Avito ↔ amoCRM (19.11/20.11 Роман: «не бот их создавал, а они шли с Avito»). Сначала
     ищем её: по телефону, в «Неразобранном» (принимаем), среди принятых сделок. Не нашли: create_city is None — None
     (поищем снова); иначе создаём сами — 21.11 Роман: «они всегда должны попадать в амо», а интеграция с 17.11
@@ -226,6 +243,10 @@ def find_lead(name: str, phone: str | None, first_note: str, stage: str = "new",
         _log_match(f"«{name}»: сделки от интеграции Avito пока нет — жду её, через 15 минут создам сам")
         return None
     stats["created"] += 1  # в /status: «нашёл сделок»
+    try:
+        rename_default(lead_id, name, city or create_city or "")
+    except RuntimeError as e:
+        _fail(e)
     note(lead_id, first_note)
     advance(lead_id, stage)
     return lead_id

@@ -15,7 +15,7 @@ import sheets  # noqa: E402
 import telegram_api as tg  # noqa: E402
 import ai_reply  # noqa: E402
 import amo_crm  # noqa: E402
-from script_engine import (MONTHS, TIME_RE, ZOOM_MARK, _client_time, _requested_date,  # noqa: E402
+from script_engine import (MONTHS, REFUSE_RE, TIME_RE, ZOOM_MARK, _client_time, _requested_date,  # noqa: E402
                            analyze_dialog, auto_decision, booking_key,
                            category_text, confirm_block, day_label, expand_slots, generate_variants, is_past)
 
@@ -42,6 +42,7 @@ HELP_TEXT = (
     "/week — расписание на неделю (показать или задать: /week ср 14:00-16:00 пт 16-22 сб 11-22)\n"
     "/price около 1000 ₽ за час — что отвечать на вопрос о цене (/price без текста — не называть цену)\n"
     "/zoom https://… — ссылка Zoom для подтверждения записи\n"
+    "/book — записать клиента на пробный кнопками (или «📅 Записать на пробный» в карточке клиента)\n"
     "/booked Имя | Телефон | Когда | Класс | chat_id — записать на пробный\n"
     "/team — кто ещё получает заявки. Помощнику: открыть этого бота и отправить /join, вам придёт запрос"
 )
@@ -395,7 +396,16 @@ def _sent_card_text(v: dict, sent_text: str) -> str:
 
 
 def _card_buttons(row_id: str) -> dict:
-    return tg.inline_keyboard([("✅ Отправить", f"send:{row_id}"), ("❌ Исправить", f"edit:{row_id}")])
+    return tg.keyboard_rows([[("✅ Отправить", f"send:{row_id}"), ("❌ Исправить", f"edit:{row_id}")],
+                             [_book_button(row_id)]])
+
+
+def _book_button(row_id: str) -> tuple[str, str]:
+    return ("📅 Записать на пробный", f"bk:{row_id}")
+
+
+def _book_only(row_id: str, note: tuple[str, str] | None = None) -> dict:
+    return tg.keyboard_rows(([[note]] if note else []) + [[_book_button(row_id)]])
 
 
 # ---------- варианты ответа ----------
@@ -520,7 +530,8 @@ def _amo_set_booked(row_id: str, v: dict, phone: str | None, when: str, how: str
     lead = _amo_lead(row_id)
     if not lead:
         lead = amo_crm.find_lead(v["Имя"], phone, _amo_first_note(v["Имя"], v["Город"], v["Категория"], v["chat_id"], ""),
-                                 stage="booked", client_text=v.get("Сообщение клиента", ""), taken=_amo_taken())
+                                 stage="booked", client_text=v.get("Сообщение клиента", ""), taken=_amo_taken(),
+                                 city=v.get("Город", ""))
         _amo_save_log()
         if not lead:
             tg.send_message(ADMIN_ID, f"📇 Не нашёл в amoCRM сделку {v['Имя']} от интеграции Avito — этап "
@@ -539,7 +550,7 @@ def _amo_set_booked(row_id: str, v: dict, phone: str | None, when: str, how: str
 def _show_sent(row_id: str, v: dict, text: str) -> None:
     if v.get("telegram_msg_id"):
         try:
-            tg.edit_message_text(ADMIN_ID, int(v["telegram_msg_id"]), _sent_card_text(v, text), {"inline_keyboard": []})
+            tg.edit_message_text(ADMIN_ID, int(v["telegram_msg_id"]), _sent_card_text(v, text), _book_only(row_id))
         except Exception:
             tg.send_message(ADMIN_ID, _sent_card_text(v, text))
     else:
@@ -551,6 +562,189 @@ def _show_sent(row_id: str, v: dict, text: str) -> None:
                                  {"inline_keyboard": []})
         except Exception:
             pass
+
+
+# ---------- запись на пробный кнопками (23.11, Роман: вместо ручного ввода строки в таблицу) ----------
+# «📅 Записать на пробный» в карточке или /book → день → время из свободных окон (или своё) → «Записать и отправить
+# ссылку» / «Только внести запись». Бот сам: строка в «Записаны на пробный» (chat_id, время в нужном формате),
+# этап в amoCRM, подтверждение клиенту со ссылкой Zoom, потом напоминания за 3 часа и за 30 минут.
+
+def _book_day_label(d, today) -> str:
+    if d == today:
+        return "Сегодня"
+    if d == today + timedelta(days=1):
+        return "Завтра"
+    return f"{WEEKDAY_SHORT[d.weekday()]} {d:%d.%m}"
+
+
+def _future_booking(v: dict) -> str:
+    """Ближайшая будущая запись этого клиента (по chat_id) — «25.11.2026 17:30» или ""."""
+    now = datetime.now(MSK)
+    times = sorted(w for b in sheets.get_bookings() if (b.get("chat_id") or "").strip() == v.get("chat_id")
+                   for w in [_parse_msk(norm_when(b.get("Когда пробный урок", "")))] if w and w > now)
+    return f"{times[0]:%d.%m.%Y %H:%M}" if times else ""
+
+
+def _book_days_screen(row_id: str, v: dict) -> tuple[str, dict]:
+    today = datetime.now(MSK).date()
+    sched = schedule() or {}
+    days = [(_book_day_label(d, today) + f" ({len(sched[d])})", f"bkd:{row_id}:{d:%d%m%Y}")
+            for d in sorted(sched) if sched[d]]
+    rows = [days[i:i + 2] for i in range(0, len(days), 2)]
+    rows.append([("✍️ Другое время", f"bkown:{row_id}"), ("✖️ Отмена", f"bkx:{row_id}")])
+    cur = _future_booking(v)
+    text = (f"📅 Запись на пробный: {v['Имя']} ({v['Город']})\n"
+            + (f"Уже записан(а) на {cur} — новая запись заменит её в напоминаниях (старую строку удалите из "
+               "листа, чтобы окно освободилось).\n" if cur else "")
+            + ("Выберите день (в скобках — свободных окон):" if days
+               else "Свободных окон в расписании нет — нажмите «✍️ Другое время»."))
+    return text, tg.keyboard_rows(rows)
+
+
+def _book_times_screen(row_id: str, v: dict, d) -> tuple[str, dict]:
+    times = (schedule() or {}).get(d, [])
+    btn = [(t, f"bkt:{row_id}:{d:%d%m%Y}{t.replace(':', '')}") for t in times]
+    rows = [btn[i:i + 4] for i in range(0, len(btn), 4)]
+    rows.append([("◀️ Другой день", f"bk:{row_id}:e"), ("✍️ Другое время", f"bkown:{row_id}")])
+    label = _book_day_label(d, datetime.now(MSK).date()).lower()
+    return (f"📅 {v['Имя']} ({v['Город']}): {label} — выберите время" if times
+            else f"📅 {label}: свободных окон уже нет"), tg.keyboard_rows(rows)
+
+
+def _book_client_text(dt: datetime) -> str:
+    return (confirm_block(sheets.get_state("zoom_link", ""))
+            + f"\n\nЖду вас {day_label(dt.date(), datetime.now(MSK).date())} в {dt:%H:%M} мск!")
+
+
+def _book_confirm_screen(row_id: str, v: dict, dt: datetime) -> tuple[str, dict]:
+    key = f"{dt:%d%m%Y%H%M}"
+    zoom = ZOOM_MARK in sheets.get_state("zoom_link", "")
+    taken = f"{dt:%d.%m.%Y %H:%M}" in booked_set()
+    text = (f"📅 Запись на пробный: {v['Имя']} ({v['Город']}) — {day_label(dt.date(), datetime.now(MSK).date())} "
+            f"в {dt:%H:%M}. Записываю?"
+            + ("\n⚠️ На это время уже есть запись." if taken else "")
+            + (f"\n\nКлиенту в Avito уйдёт:\n«{_book_client_text(dt)}»" if zoom
+               else "\n\n⚠️ Ссылка Zoom не задана (/zoom) — могу только внести запись, без сообщения клиенту."))
+    rows = ([[("✅ Записать и отправить ссылку", f"bko:{row_id}:{key}:1")]] if zoom else []) + [
+        [("📋 Только внести запись", f"bko:{row_id}:{key}:0")],
+        [("◀️ Назад", f"bkd:{row_id}:{dt:%d%m%Y}"), ("✖️ Отмена", f"bkx:{row_id}")]]
+    return text, tg.keyboard_rows(rows)
+
+
+def _parse_book_time(text: str, now: datetime) -> datetime | None:
+    """«25.11 17:30», «25.11.2026 в 17.30», «завтра в 18:00», «25 ноября 17:30», «18:30» (ближайшее)."""
+    m = re.search(r"(\d{1,2})\.(\d{1,2})(?:\.(\d{2,4}))?\s*(?:в\s*)?(\d{1,2})[:.,](\d{2})", text)
+    if m:
+        d, mo, y, h, mi = m.groups()
+        year = (int(y) + (2000 if len(y) == 2 else 0)) if y else now.year
+        try:
+            dt = datetime(year, int(mo), int(d), int(h), int(mi), tzinfo=MSK)
+        except ValueError:
+            return None
+        if not y and dt < now - timedelta(days=7):
+            dt = dt.replace(year=dt.year + 1)
+        return dt
+    return _time_in_text(re.sub(r"(\d{1,2}),(\d{2})", r"\1:\2", text), now)
+
+
+def _book_do(user_id: int, row_id: str, v: dict, dt: datetime, send: bool, message_id: int) -> None:
+    now = datetime.now(MSK)
+    when = f"{dt:%d.%m.%Y %H:%M}"
+    if dt < now - timedelta(minutes=5):
+        tg.edit_message_text(ADMIN_ID, message_id, f"⚠️ {when} уже прошло — выберите другое время.",
+                             _book_only(row_id))
+        return
+    if any((b.get("chat_id") or "").strip() == v["chat_id"] and norm_when(b.get("Когда пробный урок", "")) == when
+           for b in sheets.get_bookings()):
+        tg.edit_message_text(ADMIN_ID, message_id, f"✅ {v['Имя']} уже записан(а) на {when}.", {"inline_keyboard": []})
+        return
+    try:
+        meta = json.loads(sheets.get_state(f"meta_{row_id}", "") or "{}")
+    except ValueError:
+        meta = {}
+    phone = meta.get("phone") or ""
+    if send:
+        text = _book_client_text(dt)
+        try:
+            avito_client.send_message(user_id, v["chat_id"], text)
+        except Exception as e:
+            _note_error("запись: отправка в Avito", e)
+            tg.edit_message_text(ADMIN_ID, message_id, f"❌ Не отправил {v['Имя']} подтверждение: {str(e)[:150]}\n"
+                                                       "Запись не внёс — нажмите ещё раз через минуту.",
+                                 _book_confirm_screen(row_id, v, dt)[1])
+            return
+        _cancel_auto(row_id)
+        status = "отправлено (запись из Telegram)"
+        sheets.mark_status_cached(row_id, status, text)
+        sheets.update_contact_status(row_id, status, new_draft=text)
+        if v.get("telegram_msg_id"):
+            tg.edit_message_reply_markup(ADMIN_ID, int(v["telegram_msg_id"]),
+                                         _book_only(row_id, (f"✅ Записан(а) на {dt:%d.%m %H:%M}", "noop")))
+        lead = _amo_lead(row_id)
+        if lead:
+            _amo_safe("ответ клиенту", amo_crm.note, lead, f"Ответ из Telegram в Avito:\n{text}")
+    sheets.log_booking(v["Имя"], phone or "—", v["chat_id"], when, v["Категория"])
+    lead = _amo_safe("запись на пробный", _amo_set_booked, row_id, v, phone or None, when,
+                     "Записан кнопкой в Telegram." + (" Ссылка Zoom отправлена." if send else ""))
+    soon = dt - now <= timedelta(minutes=30)
+    tg.edit_message_text(
+        ADMIN_ID, message_id,
+        f"📅 Записал {v['Имя']} ({v['Город']}) {day_label(dt.date(), now.date())} в {dt:%H:%M}"
+        + (" — клиенту отправил подтверждение со ссылкой Zoom." if send else " — клиенту ничего не отправлял.")
+        + ("" if soon else "\nНапомню клиенту за 3 часа и за 30 минут.")
+        + ("\namoCRM: «Назначен пробный урок»." if lead else "")
+        + "\nСтрока добавлена в «Записаны на пробный».", {"inline_keyboard": []})
+
+
+def _book_callback(user_id: int, cq: dict, action: str, rest: str, v: dict, row_id: str, message_id: int) -> None:
+    parts = rest.split(":")
+    if action == "bk":
+        tg.answer_callback_query(cq["id"])
+        text, markup = _book_days_screen(row_id, v)
+        if len(parts) > 1 and parts[1] == "e":
+            tg.edit_message_text(ADMIN_ID, message_id, text, markup)
+        else:
+            tg.send_message(ADMIN_ID, text, reply_markup=markup)
+        return
+    if action == "bkx":
+        tg.answer_callback_query(cq["id"])
+        tg.edit_message_text(ADMIN_ID, message_id, f"✖️ Запись {v['Имя']} отменена — ничего не менял.",
+                             {"inline_keyboard": []})
+        return
+    if action == "bkown":
+        tg.answer_callback_query(cq["id"])
+        prompt = tg.send_message(ADMIN_ID, f"✍️ Когда пробный у {v['Имя']} ({v['Город']})? Ответьте (reply) на это "
+                                           "сообщение: например «25.11 17:30» или «завтра в 18:00».")
+        sheets.set_state(f"bkask_{prompt.get('message_id')}", row_id)
+        return
+    if action == "bkd":
+        tg.answer_callback_query(cq["id"])
+        d = datetime.strptime(parts[1], "%d%m%Y").date()
+        tg.edit_message_text(ADMIN_ID, message_id, *_book_times_screen(row_id, v, d))
+        return
+    if action == "bkt":
+        tg.answer_callback_query(cq["id"])
+        dt = datetime.strptime(parts[1], "%d%m%Y%H%M").replace(tzinfo=MSK)
+        tg.edit_message_text(ADMIN_ID, message_id, *_book_confirm_screen(row_id, v, dt))
+        return
+    if action == "bko":
+        tg.answer_callback_query(cq["id"], "Записываю…")
+        dt = datetime.strptime(parts[1], "%d%m%Y%H%M").replace(tzinfo=MSK)
+        _book_do(user_id, row_id, v, dt, parts[2] == "1", message_id)
+        return
+
+
+def _book_list_text() -> tuple[str, dict | None]:
+    """/book — клиенты, писавшие за последнюю неделю (новые сверху)."""
+    now = datetime.now(MSK)
+    recent = sorted(((w, c) for c in sheets.all_contacts() if c.get("Имя") not in ("", "—") and c.get("chat_id")
+                     and not sheets.get_state(f"amo_skip_{c.get('id', '')}", "")
+                     for w in [_parse_msk(f"{c.get('Дата', '')} {c.get('Время', '')}")]
+                     if w and now - w <= timedelta(days=7)), key=lambda x: x[0], reverse=True)[:10]
+    if not recent:
+        return "За неделю никто не писал — записывать некого.", None
+    rows = [[(f"{c['Имя']} ({c['Город']}, {w:%d.%m})", f"bk:{c['id']}")] for w, c in recent]
+    return "📅 Кого записать на пробный?", tg.keyboard_rows(rows)
 
 
 # ---------- Telegram ----------
@@ -605,6 +799,10 @@ def handle_callback(user_id: int, cq: dict) -> None:
         return
     v = contact["values"]
 
+    if action in ("bk", "bkd", "bkt", "bko", "bkown", "bkx"):
+        _book_callback(user_id, cq, action, rest, v, row_id, message_id)
+        return
+
     if action in ("trok", "trno"):  # «Пробный прошёл?» → amoCRM
         lead = _amo_lead(row_id)
         if not lead or not _amo_on():
@@ -612,9 +810,16 @@ def handle_callback(user_id: int, cq: dict) -> None:
             return
         tg.answer_callback_query(cq["id"], "Отмечаю в amoCRM…")
         if action == "trok":
-            ok = _amo_safe("пробный прошёл", lambda: (amo_crm.advance(lead, "trial_done"),
-                                                     amo_crm.note(lead, "Пробный урок проведён."))[0])
-            text = (f"✅ Пробный с {v['Имя']} проведён — в amoCRM «Проведен пробный урок»." if ok
+            def held():
+                moved = amo_crm.advance(lead, "trial_done")
+                amo_crm.note(lead, "Пробный урок проведён.")
+                # 23.11, Роман: после пробного — задача узнать решение (свою ставим, чужие задачи не трогаем)
+                amo_crm.task(lead, f"Узнать решение после пробного: {v['Имя']} ({v['Город']}) — связаться, "
+                                   "ответить на вопросы, предложить занятия", hours=48)
+                return moved
+            ok = _amo_safe("пробный прошёл", held)
+            text = (f"✅ Пробный с {v['Имя']} проведён — в amoCRM «Проведен пробный урок», через 2 дня задача "
+                    "«Узнать решение»." if ok
                     else f"⚠️ Не получилось отметить в amoCRM пробный с {v['Имя']} — подробности в /status.")
         else:
             def not_held():
@@ -933,6 +1138,11 @@ def handle_message(user_id: int, msg: dict) -> None:
                         "Цену больше не называю: отвечаю, что стоимость зависит от частоты и целей.")
         return
 
+    if text == "/book" or text.startswith("/book "):
+        body, markup = _book_list_text()
+        tg.send_message(ADMIN_ID, body, reply_markup=markup)
+        return
+
     if text.startswith("/booked"):
         fields = [p.strip() for p in text[len("/booked"):].split("|")]
         fields += ["—"] * (5 - len(fields))
@@ -946,6 +1156,17 @@ def handle_message(user_id: int, msg: dict) -> None:
         replied_id = reply_to.get("message_id")
         if str(replied_id) == sheets.get_state("slots_prompt_msg_id", ""):
             _save_slots(text)
+            return
+        book_row = sheets.get_state(f"bkask_{replied_id}", "")
+        if book_row:
+            bc = sheets.get_contact_by_id(book_row)
+            dt = _parse_book_time(text, datetime.now(MSK))
+            if not bc or not dt:
+                tg.send_message(ADMIN_ID, "Не понял дату и время. Напишите, например, «25.11 17:30» — ответом на "
+                                          "сообщение с вопросом.")
+                return
+            screen, markup = _book_confirm_screen(book_row, bc["values"], dt)
+            tg.send_message(ADMIN_ID, screen, reply_markup=markup)
             return
         row_id = (sheets.find_row_id_by_telegram_msg_id(replied_id) or sheets.get_state(f"card_{replied_id}", "")
                   or sheets.get_state(f"reply_{replied_id}", ""))
@@ -1029,6 +1250,69 @@ def process_telegram_updates(user_id: int, offset: int, timeout: int) -> int:
 
 _asked_today = ""  # страховка внутри процесса: даже если таблица подведёт, спросим не чаще раза в день
 
+# ---------- утренняя сводка (23.11, Роман: одно сообщение в день вместо поиска по /status) ----------
+# Пробные сегодня и завтра, итоги вчера и кто ждёт ответа. Отказы («договорились с другим», «не интересно») и
+# короткие «хорошо / спасибо» в список ждущих не попадают — статусы в таблице при этом не меняем.
+NOT_WAITING_RE = re.compile(r"договорил\w*\s+с\s+друг|(?<![а-яё])не\s+ин?т[еи]р[еи]сн|(все|всё)\s+понятно", re.I)
+ACK_RE = re.compile(r"^\W*(хорошо|ок|окей|ok|спасибо|благодарю|понял\w*|ясно|отлично|договорились|принято|супер|"
+                    r"ладно|до\s+свидания)\b", re.I)
+
+
+def _still_waiting(c: dict, books: list) -> bool:
+    if sheets.get_state(f"amo_skip_{c.get('id', '')}", ""):
+        return False  # Роман просил этого клиента не вести (Полина, ОПРАВА)
+    first = (c.get("Имя") or "").strip().lower().split()[:1]
+    seen = _parse_msk(f"{c.get('Дата', '')} 00:00")
+    for b in books:  # уже записан на пробный после этого сообщения — «в 17.00 / хорошо» ответа не ждут
+        made = _parse_msk(b.get("Дата и время", "")) or _parse_msk(norm_when(b.get("Когда пробный урок", "")))
+        ch = (b.get("chat_id") or "").strip()
+        if made and seen and made >= seen and (ch == c.get("chat_id") or (
+                ch in ("", "—") and (b.get("Имя") or "").strip().lower().split()[:1] == first)):
+            return False
+    t = (c.get("Сообщение клиента") or "").split(" / ")[-1].strip()
+    if REFUSE_RE.search(t) or NOT_WAITING_RE.search(t):
+        return False
+    return not (len(t) <= 40 and ACK_RE.search(t))
+
+
+def morning_summary_text() -> str:
+    now = datetime.now(MSK)
+    today, yday = now.date(), (now - timedelta(days=1)).date()
+    books = sheets.get_bookings()
+    trials = sorted((w, b.get("Имя", "")) for b in books
+                    for w in [_parse_msk(norm_when(b.get("Когда пробный урок", "")))] if w)
+    tod = [f"{w:%H:%M} {n}" for w, n in trials if w.date() == today]
+    tom = [f"{w:%H:%M} {n}" for w, n in trials if w.date() == today + timedelta(days=1)]
+    lines = [f"☀️ Доброе утро! Сводка на {today:%d.%m}", "",
+             "📅 Пробные сегодня: " + (", ".join(tod) if tod else "нет"),
+             "Завтра: " + (", ".join(tom) if tom else "нет")]
+    contacts = [c for c in sheets.all_contacts() if c.get("Имя") not in ("", "—")]
+    wrote = len([c for c in contacts if (_parse_msk(f"{c.get('Дата', '')} 00:00") or now).date() == yday])
+    booked = len([b for b in books if (_parse_msk(b.get("Дата и время", "")) or now).date() == yday])
+    held = len([1 for w, _ in trials if w.date() == yday])
+    lines += ["", f"📨 Вчера: писали {wrote}, записались на пробный {booked}, пробных было назначено {held}"]
+    waiting = sorted(((w, c) for c in contacts if c.get("Статус") == "ожидает" and _still_waiting(c, books)
+                      for w in [_parse_msk(f"{c.get('Дата', '')} {c.get('Время', '')}")]
+                      if w and timedelta(hours=1) <= now - w <= timedelta(days=10)), key=lambda x: x[0])
+    if waiting:
+        lines += ["", f"⏳ Ждут вашего ответа ({len(waiting)}):"]
+        for w, c in waiting[:10]:
+            last = (c.get("Сообщение клиента") or "").split(" / ")[-1].strip().replace("\n", " ")
+            lines.append(f"• {w:%d.%m} {c['Имя']} ({c['Город']}): «{last[:70]}{'…' if len(last) > 70 else ''}»")
+        lines.append("Ответить — reply на карточку клиента или прямо в Avito.")
+    else:
+        lines += ["", "⏳ Ждущих ответа нет 👍"]
+    return "\n".join(lines)
+
+
+def maybe_morning_summary() -> None:
+    """Сводка раз в день с 9:00 — если её ещё не было в утреннем сообщении о расписании."""
+    today = today_str()
+    if datetime.now(MSK).hour < 9 or _same_day(sheets.get_state("summary_date", ""), today):
+        return
+    sheets.set_state("summary_date", today)
+    tg.send_message(ADMIN_ID, morning_summary_text())
+
 
 def maybe_ask_daily_slots() -> None:
     global _asked_today
@@ -1047,16 +1331,18 @@ def maybe_ask_daily_slots() -> None:
         todays = day_slots_text(datetime.now(MSK).date())
         if not todays:
             sheets.set_state("slots_prompt_date", today)
-            return
+            return  # выходной — сводку пришлёт maybe_morning_summary
+        sheets.set_state("summary_date", today)
         prompt = tg.send_message(
             ADMIN_ID,
-            f"Доброе утро! Сегодня по расписанию записываю на пробные: {todays}.\n"
+            morning_summary_text() + f"\n\n🕐 Сегодня по расписанию записываю на пробные: {todays}.\n"
             "Если что-то изменилось — пришлите новое время на сегодня (например 15:00-18:00).",
         )
     else:
+        sheets.set_state("summary_date", today)
         prompt = tg.send_message(
             ADMIN_ID,
-            "Доброе утро! Какое время сегодня свободно для пробных уроков?\n"
+            morning_summary_text() + "\n\n🕐 Какое время сегодня свободно для пробных уроков?\n"
             "Напишите свободные часы (15:00, 18:00) или промежуток (15:00-18:00) — "
             "в каждый час запишу до 2 человек по 30 минут.",
         )
@@ -1391,8 +1677,7 @@ def _mark_answered_in_avito(chat_id: str) -> None:
     sheets.update_contact(v["id"], {"Статус": "отвечено (в Avito)"})
     for msg_id in {v.get("telegram_msg_id"), _variant_msgs.pop(v["id"], None)}:
         if msg_id:
-            tg.edit_message_reply_markup(ADMIN_ID, int(msg_id), tg.inline_keyboard(
-                [("✍️ Вы уже ответили в Avito", "noop")]))
+            tg.edit_message_reply_markup(ADMIN_ID, int(msg_id), _book_only(v["id"], ("✍️ Вы уже ответили в Avito", "noop")))
 
 
 # ---------- автоответ ----------
@@ -1431,6 +1716,7 @@ def _auto_buttons(row_id: str) -> dict:
     return tg.keyboard_rows([
         [("✅ Отправить сейчас", f"now:{row_id}"), ("🚫 Не отправлять", f"noauto:{row_id}")],
         [("❌ Исправить", f"edit:{row_id}")],
+        [_book_button(row_id)],
     ])
 
 
@@ -1596,7 +1882,7 @@ def _amo_message(row_id: str, is_new: bool, name: str, city: str, category: str,
         if not lead:  # сделку создаёт интеграция Avito ↔ amoCRM — находим её (может появиться не сразу)
             lead = amo_crm.find_lead(name, a.get("phone"), _amo_first_note(name, city, category, chat_id, client_text),
                                      client_text=client_text, taken=_amo_taken(), create_city=city if create else None,
-                                     near_ts=near_ts or time.time())
+                                     near_ts=near_ts or time.time(), city=city)
             _amo_save_log()
             if not lead:
                 return
@@ -1647,7 +1933,8 @@ def amo_sync_bookings_once() -> None:
 
         def run():
             lead = amo_crm.find_lead(v["Имя"], phone, _amo_first_note(v["Имя"], v["Город"], v["Категория"], chat, ""),
-                                     stage="booked", client_text=v.get("Сообщение клиента", ""), taken=_amo_taken())
+                                     stage="booked", client_text=v.get("Сообщение клиента", ""), taken=_amo_taken(),
+                                     city=v.get("Город", ""))
             if not lead:
                 return "сделки от интеграции Avito не нашёл"
             sheets.set_state(f"amo_{v['id']}", str(lead))
@@ -1791,6 +2078,18 @@ def amo_remove_once() -> None:
 
 BOT_MADE_LEADS = {38637043, 38637047, 38637049, 38637053}  # 20.11 15:32–15:33 сделки создал бот (Полина, ОПРАВА, Тетя-мотя, Наташа)
 _hist_tries = {}
+
+
+def amo_rename_once() -> None:
+    """Один раз (23.11): сделки интеграции, уже привязанные к клиентам, называем «Имя — Avito (город)»."""
+    if not _amo_on() or not amo_crm.ready() or sheets.get_state("amo_rename_done", "") == "v1":
+        return
+    for c in sheets.all_contacts():
+        lead = _amo_lead(c.get("id", ""))
+        if lead and not sheets.get_state(f"amo_skip_{c['id']}", ""):
+            amo_crm.rename_default(lead, c.get("Имя", ""), c.get("Город", ""))
+    sheets.set_state("amo_rename_done", "v1")
+    _amo_save_log()
 
 
 def amo_history_backfill_once(user_id: int) -> None:
@@ -2023,6 +2322,10 @@ def _run_avito_check(user_id: int) -> None:
     t = time.time()
     try:
         maybe_ask_daily_slots()
+        try:
+            maybe_morning_summary()
+        except Exception as e:
+            _note_error("утренняя сводка", e)
         check_new_avito_messages(user_id)
         try:
             avito_link_bookings(user_id)
@@ -2039,6 +2342,7 @@ def _run_avito_check(user_id: int) -> None:
             amo_remove_once()
             amo_catch_up(user_id)
             amo_history_backfill_once(user_id)
+            amo_rename_once()
             _amo_trial_followups()
         except Exception as e:
             _note_error("amoCRM (пробные)", e)
