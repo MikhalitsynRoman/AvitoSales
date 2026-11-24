@@ -2806,6 +2806,11 @@ def main() -> None:
                 amo_crm.lookup(part.strip()) for part in q.split("|") if part.strip()))
             sheets.set_state("amo_lookup_q", "")
         if amo_crm.ready():
+            try:  # 24.11: кто ответственный (только чтение) — проверить, что бот нашёл Романа
+                sheets.set_state("amo_owners", f"{_now()}\n{amo_crm.owners_report()}")
+            except Exception as e:
+                sheets.set_state("amo_owners", f"{_now()}: ошибка {str(e)[:200]}")
+        if amo_crm.ready():
             sheets.set_state("amo_fields_diag", f"{_now()}: {amo_crm.ensure_fields()}")
             sheets.set_state("amo_fields_report", f"{_now()}\n" + amo_crm.fields_report())
         if amo_crm.ready():

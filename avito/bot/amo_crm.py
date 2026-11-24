@@ -96,6 +96,59 @@ def setup() -> str:
     return ""
 
 
+# ---------- ответственный (24.11, Роман: «чтобы ответственный всегда был Михалицын Роман») ----------
+# Раньше бот ответственного не задавал — его ставили amoCRM / интеграция Avito. Теперь у каждой сделки, которую бот
+# находит, создаёт или двигает, и у каждой его задачи ответственный — пользователь amo с фамилией Михалицын.
+OWNER_SURNAME = "михалицын"
+_owner = {"id": None, "name": "", "users": {}}
+
+
+def owner_id() -> int | None:
+    if _owner["id"] is None:
+        data = _get("users", {"limit": 250})
+        users = {u["id"]: u.get("name", "") for u in (data.get("_embedded") or {}).get("users", [])}
+        _owner["users"] = users
+        for uid, name in users.items():
+            if OWNER_SURNAME in name.lower():
+                _owner["id"], _owner["name"] = uid, name
+                break
+    return _owner["id"]
+
+
+def ensure_owner(lead: dict) -> str:
+    """lead — сделка из GET leads/{id}. Ставит ответственным Романа, если там кто-то другой."""
+    oid = owner_id()
+    if not oid or not lead.get("id") or lead.get("responsible_user_id") == oid:
+        return ""
+    was = _owner["users"].get(lead.get("responsible_user_id"), lead.get("responsible_user_id"))
+    _req("PATCH", f"leads/{lead['id']}", body={"responsible_user_id": oid})
+    _log_match(f"сделка #{lead['id']}: ответственный {_owner['name']} (был {was})")
+    return "ответственный"
+
+
+def owners_report() -> str:
+    """Только чтение: пользователи amo и у кого сколько открытых сделок в «Продажа курса»."""
+    oid = owner_id()
+    lines = [f"Ответственный для бота: {_owner['name'] or 'НЕ НАЙДЕН (нет пользователя с фамилией Михалицын)'}"
+             + (f" (id {oid})" if oid else ""), "Пользователи amo:"]
+    lines += [f"  • {n} (id {i})" for i, n in _owner["users"].items()]
+    counts, page = {}, 1
+    while page <= 10:
+        data = _get("leads", {"filter[pipeline_id]": _pipe["id"], "limit": 250, "page": page})
+        leads = (data.get("_embedded") or {}).get("leads", [])
+        for lead in leads:
+            if lead.get("status_id") in (WON, LOST):
+                continue
+            who = _owner["users"].get(lead.get("responsible_user_id"), str(lead.get("responsible_user_id")))
+            counts[who] = counts.get(who, 0) + 1
+        if len(leads) < 250:
+            break
+        page += 1
+    lines.append(f"Открытые сделки в «{PIPELINE_NAME}» по ответственным:")
+    lines += [f"  • {who}: {n}" for who, n in sorted(counts.items(), key=lambda x: -x[1])]
+    return "\n".join(lines)
+
+
 def ready() -> bool:
     return available() and _pipe is not None
 
@@ -113,8 +166,11 @@ def note(lead_id: int, text: str) -> None:
 
 
 def task(lead_id: int, text: str, hours: float = 1) -> None:
-    _req("POST", "tasks", body=[{"text": text[:1000], "complete_till": int(time.time() + hours * 3600),
-                                 "entity_id": lead_id, "entity_type": "leads"}])
+    body = {"text": text[:1000], "complete_till": int(time.time() + hours * 3600),
+            "entity_id": lead_id, "entity_type": "leads"}
+    if owner_id():
+        body["responsible_user_id"] = owner_id()
+    _req("POST", "tasks", body=[body])
     stats["tasks"] += 1
 
 
@@ -247,6 +303,10 @@ def find_lead(name: str, phone: str | None, first_note: str, stage: str = "new",
         rename_default(lead_id, name, city or create_city or "")
     except RuntimeError as e:
         _fail(e)
+    try:
+        ensure_owner(_get(f"leads/{lead_id}"))
+    except RuntimeError as e:
+        _fail(e)
     note(lead_id, first_note)
     advance(lead_id, stage)
     return lead_id
@@ -257,10 +317,11 @@ def _create_lead(name: str, city: str, phone: str | None, contact_id: int | None
     if phone and not contact_id:
         contact["custom_fields_values"] = [{"field_code": "PHONE", "values": [{"value": phone, "enum_code": "WORK"}]}]
     title = f"{name or 'Клиент'} — Avito" + (f" ({city})" if city and city != "—" else "")
-    res = _req("POST", "leads/complex", body=[{
-        "name": title[:250], "pipeline_id": _pipe["id"], "status_id": _pipe["stage"][stage],
-        "_embedded": {"contacts": [contact], "tags": [{"name": TAG}]},
-    }])
+    body = {"name": title[:250], "pipeline_id": _pipe["id"], "status_id": _pipe["stage"][stage],
+            "_embedded": {"contacts": [contact], "tags": [{"name": TAG}]}}
+    if owner_id():
+        body["responsible_user_id"] = owner_id()
+    res = _req("POST", "leads/complex", body=[body])
     lead_id = res[0]["id"]
     stats["made"] += 1
     _log_match(f"«{name}»: интеграция Avito сделку не создала — создал сам #{lead_id}")
@@ -414,6 +475,10 @@ def advance(lead_id: int, stage: str) -> str:
     cur = lead.get("status_id")
     if lead.get("pipeline_id") != _pipe["id"]:
         return "в другой воронке — не трогаю"
+    try:
+        ensure_owner(lead)
+    except RuntimeError as e:
+        _fail(e)
     if cur == WON:
         return "уже успешно реализовано — не трогаю"
     if cur == _pipe["unsorted"]:
