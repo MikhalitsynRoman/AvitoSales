@@ -602,6 +602,8 @@ def _human_text(chat_id: str, dialog: list[dict]) -> str:
 
 
 HUMAN_WHY = "в этом чате клиенту уже отвечали вы или Светлана — бот сам не пишет, переписку ведёте вы"
+# 24.11, Роман: «да, через 15 минут» — если в «человеческом» чате клиенту никто не ответил 15 минут, отвечает бот
+HUMAN_WAIT = 15 * 60
 
 
 # ---------- карточки ----------
@@ -2065,8 +2067,10 @@ def _auto_buttons(row_id: str) -> dict:
     ])
 
 
-def _schedule_auto(row_id: str, chat_id: str, msg_id: str, text: str, card_id: int | None) -> None:
-    item = {"due": time.time() + AUTO_DELAY, "chat_id": chat_id, "msg_id": msg_id, "text": text, "card": card_id}
+def _schedule_auto(row_id: str, chat_id: str, msg_id: str, text: str, card_id: int | None,
+                   due: float | None = None) -> None:
+    item = {"due": due or time.time() + AUTO_DELAY, "chat_id": chat_id, "msg_id": msg_id, "text": text,
+            "card": card_id, "human_wait": bool(due)}
     _pending_auto[row_id] = item
     sheets.set_state(f"auto_{row_id}", json.dumps(item, ensure_ascii=False))  # переживёт перезапуск
 
@@ -2109,7 +2113,7 @@ def _send_auto(user_id: int, row_id: str, item: dict) -> None:
     if _stale_reason(item["text"], {**v, "Дата": today_str()}, row_id):
         tg.send_message(ADMIN_ID, f"⏸ Не отправил автоответ {v['Имя']}: время в нём устарело. Нажмите «❌ Исправить».")
         return
-    if _human_text(item["chat_id"], _load_dialog(user_id, item["chat_id"])):
+    if not item.get("human_wait") and _human_text(item["chat_id"], _load_dialog(user_id, item["chat_id"])):
         if item.get("card"):
             tg.edit_message_reply_markup(ADMIN_ID, int(item["card"]), tg.keyboard_rows(
                 [[("⏸ Автоответ не отправлен: в чате пишет человек", "noop")]] + _card_buttons(row_id)["inline_keyboard"]))
@@ -2552,7 +2556,7 @@ def _notify_client(user_id: int, chat_id: str, name: str, city: str, avito_msg_i
     # 🧠 DeepSeek отвечает по смыслу всей переписки; правила — страховка и запасной вариант, если модель
     # недоступна или её ответ не прошёл проверку (ai_reply.validate)
     human = _human_text(chat_id, dialog)
-    ai, ai_tag, hard = None, "", _hard_manual_reason(a) or (HUMAN_WHY if human else "")
+    ai, ai_tag, hard = None, "", _hard_manual_reason(a)
     if allow_auto and _ai_enabled() and not hard:
         ai = ai_reply.ai_reply(name, dialog, a, schedule(own), sheets.get_state("price_hint", ""), variants[0])
         err = ai_reply.usage().get("last_error", "")
@@ -2577,8 +2581,8 @@ def _notify_client(user_id: int, chat_id: str, name: str, city: str, avito_msg_i
     # отвечать ли самому: только в распознанных ситуациях, при включённом автоответе и в пределах лимитов
     auto_ok, why = (False, "")
     if allow_auto and _auto_enabled():
-        if human:
-            auto_ok, why = False, f"{HUMAN_WHY} ({human})"
+        if hard:
+            auto_ok, why = False, hard
         elif ai and ai["action"] == "manual":
             auto_ok, why = False, "DeepSeek считает, что лучше ответить вам: " + (ai.get("reason") or "нестандартный вопрос")
         elif ai:
@@ -2586,8 +2590,14 @@ def _notify_client(user_id: int, chat_id: str, name: str, city: str, avito_msg_i
         else:
             auto_ok, why = auto_decision(a, ", ".join(free_slots_today(own)), schedule(own))
         if auto_ok:
-            auto_ok, why = _auto_limits_ok(chat_id, a, existing)
+            # в «человеческом» чате человек и так ведёт диалог — вместо проверки «вы сейчас сами ведёте» ждём 15 минут
+            auto_ok, why = _auto_limits_ok(chat_id, {} if human else a, existing)
+    last_in_ts = max([m["created"] for m in dialog if m["direction"] == "in"] or [time.time()])
+    wait_due = max(time.time(), last_in_ts + HUMAN_WAIT) if human and auto_ok else 0
     auto_title = (f" — отвечу сам через {AUTO_DELAY // 60} мин" if AUTO_DELAY else " — отвечаю сам")
+    if wait_due:
+        auto_title = (f" — в чате отвечали вы или Светлана; если до {datetime.fromtimestamp(wait_due, MSK):%H:%M} "
+                      "никто не ответит, отвечу сам")
     card_text = _card_text(card, dialog, a.get("phone"), ai_tag + "🤖 " + title + auto_title if auto_ok
                            else ai_tag + title)
     if allow_auto and _auto_enabled() and not auto_ok and why:
@@ -2595,10 +2605,10 @@ def _notify_client(user_id: int, chat_id: str, name: str, city: str, avito_msg_i
     if ai and ai.get("think"):  # Роману видно, как модель поняла переписку и почему ответила так
         card_text += f"\n\n🧠 Как понял переписку: {ai['think']}"
     # без задержки отменять нечего — кнопки обычные (останутся, только если отправка вдруг не удалась)
-    buttons = _auto_buttons(row_id) if auto_ok and AUTO_DELAY else _card_buttons(row_id)
+    buttons = _auto_buttons(row_id) if auto_ok and (AUTO_DELAY or wait_due) else _card_buttons(row_id)
     sent = tg.send_message(ADMIN_ID, card_text, reply_markup=buttons)
     if auto_ok:
-        _schedule_auto(row_id, chat_id, avito_msg_id, draft, sent.get("message_id"))
+        _schedule_auto(row_id, chat_id, avito_msg_id, draft, sent.get("message_id"), due=wait_due or None)
     print(f"NEW_MESSAGE: {name} ({city}) -> notified")
     date, hhmm = when or (today_str(), _hhmm())
     if existing and existing["values"]["id"]:
@@ -2618,7 +2628,7 @@ def _notify_client(user_id: int, chat_id: str, name: str, city: str, avito_msg_i
     # amoCRM — до автоответа, чтобы ответ бота тоже лёг в сделку примечанием
     _amo_message(row_id, not (existing and existing["values"]["id"]), name, city, category, chat_id, a, client_text,
                  why if (allow_auto and _auto_enabled() and not auto_ok) else "")
-    if auto_ok and not AUTO_DELAY and row_id in _pending_auto:
+    if auto_ok and not AUTO_DELAY and not wait_due and row_id in _pending_auto:
         # отвечаем сразу — уже после того, как заявка и время записи сохранены в таблицу
         _send_auto(user_id, row_id, _pending_auto[row_id])
 
