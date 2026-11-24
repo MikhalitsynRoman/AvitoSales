@@ -710,7 +710,9 @@ def _stale_reason(text: str, v: dict, row_id: str) -> str:
         if when < now:
             return f"это запись на {meta['book']}, а это время уже прошло"
     if "сегодня" in text.lower():
-        times = [t.replace(".", ":") for t in TIME_RE.findall(text)]
+        # 24.11: «сегодня в 21:30 или завтра в 12:00» — 12:00 относится к завтра. Раньше бот считал сегодняшними
+        # все времена в тексте, где есть слово «сегодня», и не отправил Кристине ответ DeepSeek («12:00 прошло»).
+        times = _today_times(text)
         drafted_today = _same_day(v.get("Дата", ""), today_str())
         if times and not drafted_today:
             return f"черновик писался {v.get('Дата')}, и «сегодня в {times[0]}» уже не про сегодня"
@@ -718,6 +720,25 @@ def _stale_reason(text: str, v: dict, row_id: str) -> str:
         if past:
             return f"время {', '.join(past)} сегодня уже прошло"
     return ""
+
+
+_DAY_WORD_RE = re.compile(r"сегодня|послезавтра|завтра|понедельник|вторник|сред[уае]|четверг|пятниц|суббот|"
+                          r"воскресен|\b\d{1,2}\s+(?:ноябр|декабр|январ|феврал|март|апрел|ма[яй]|июн|июл|август|"
+                          r"сентябр|октябр)", re.I)
+
+
+def _today_times(text: str) -> list[str]:
+    """Времена, которые в тексте относятся к «сегодня»: ближайшее слово дня перед временем — «сегодня»
+    (а если перед временем дня нет — ближайшее после него)."""
+    days = [(m.start(), m.group(0).lower()) for m in _DAY_WORD_RE.finditer(text)]
+    out = []
+    for m in TIME_RE.finditer(text):
+        before = [w for p, w in days if p < m.start()]
+        after = [w for p, w in days if p > m.start()]
+        word = before[-1] if before else (after[0] if after else "")
+        if word == "сегодня":
+            out.append(m.group(0).replace(".", ":"))
+    return out
 
 
 def _refuse_if_stale(cq_id: str, text: str, v: dict, row_id: str) -> bool:
