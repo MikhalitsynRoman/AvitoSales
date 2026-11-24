@@ -2807,6 +2807,12 @@ def main() -> None:
             sheets.set_state("amo_lookup_q", "")
         if amo_crm.ready():
             try:  # 24.11: кто ответственный (только чтение) — проверить, что бот нашёл Романа
+                if sheets.get_state("amo_reassign_done", "") != "potapov-v1":
+                    sheets.set_state("amo_reassign_done", "potapov-v1")  # сначала отметка: один раз, даже при сбое
+                    moved = amo_crm.reassign_open("потапов")
+                    tg.send_message(ADMIN_ID, "📇 amoCRM: перевёл на вас открытые сделки Потапова Александра "
+                                              f"({len(moved)}):\n" + ("\n".join("• " + m for m in moved) or "• не нашёл")
+                                    + "\nЭтапы и задачи не менял.")
                 sheets.set_state("amo_owners", f"{_now()}\n{amo_crm.owners_report()}")
             except Exception as e:
                 sheets.set_state("amo_owners", f"{_now()}: ошибка {str(e)[:200]}")

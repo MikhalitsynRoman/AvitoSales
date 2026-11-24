@@ -126,6 +126,29 @@ def ensure_owner(lead: dict) -> str:
     return "ответственный"
 
 
+def reassign_open(from_surname: str) -> list[str]:
+    """24.11, Роман «Да, все 6»: открытые сделки «Продажа курса», где ответственный — пользователь с этой фамилией,
+    переводим на Романа. Только ответственный; этапы, задачи и всё остальное не трогаем."""
+    oid = owner_id()
+    src = [uid for uid, n in _owner["users"].items() if from_surname in n.lower() and uid != oid]
+    if not oid or not src:
+        return []
+    moved, page = [], 1
+    while page <= 10:
+        data = _get("leads", {"filter[pipeline_id]": _pipe["id"], "limit": 250, "page": page})
+        batch = (data.get("_embedded") or {}).get("leads", [])
+        for lead in batch:
+            if (lead.get("pipeline_id") == _pipe["id"] and lead.get("status_id") not in (WON, LOST)
+                    and lead.get("responsible_user_id") in src):
+                _req("PATCH", f"leads/{lead['id']}", body={"responsible_user_id": oid})
+                moved.append(f"#{lead['id']} «{lead.get('name', '')}»")
+        if len(batch) < 250:
+            break
+        page += 1
+    _log_match(f"переназначил на {_owner['name']}: " + (", ".join(moved) or "нечего"))
+    return moved
+
+
 def owners_report() -> str:
     """Только чтение: пользователи amo и у кого сколько открытых сделок в «Продажа курса»."""
     oid = owner_id()
