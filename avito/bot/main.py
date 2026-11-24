@@ -1791,8 +1791,15 @@ def _booking_chat(user_id: int, b: dict, dt: datetime, notify: bool = True) -> s
     за последние 4 дня отправляли ссылку Zoom; если таких несколько — того, с кем в переписке звучало это время.
     Не уверен — "" и одно сообщение Роману: напоминать наугад чужому человеку нельзя."""
     chat = (b.get("chat_id") or "").strip()
+    name = re.sub(r"\s+", " ", (b.get("Имя") or "").strip().lower())
     if chat and chat != "—":
-        return chat
+        # 24.11: строку бота (Евгения) перезаписали руками под Оксану, а chat_id в дальней колонке остался —
+        # напоминание ушло бы Евгении. Верим chat_id, только если имя в строке похоже на клиента этого чата.
+        c = sheets.find_contact_by_chat(chat)
+        owner = re.sub(r"\s+", " ", (c["values"].get("Имя") or "").strip().lower()) if c else ""
+        if not owner or not name or owner.split()[:1] == name.split()[:1] or \
+                difflib.SequenceMatcher(None, owner, name).ratio() >= 0.8:
+            return chat
     name = re.sub(r"\s+", " ", (b.get("Имя") or "").strip().lower())
     key = (name, f"{dt:%d%m%H%M}")
     if not name:
@@ -1801,7 +1808,7 @@ def _booking_chat(user_id: int, b: dict, dt: datetime, notify: bool = True) -> s
         return _chat_guess[key]
     if not notify and time.time() - _chat_miss.get(key, 0) < 1800:
         return ""
-    st_key = f"bchat_{dt:%d%m%H%M}_{name.replace(' ', '_')[:30]}"
+    st_key = f"bchat2_{dt:%d%m%H%M}_{name.replace(' ', '_')[:30]}"  # v2 (24.11): старые «?» пересчитываем
     saved = sheets.get_state(st_key, "")
     if saved:
         _chat_guess[key] = "" if saved == "?" else saved
@@ -1815,15 +1822,25 @@ def _booking_chat(user_id: int, b: dict, dt: datetime, notify: bool = True) -> s
         return other.split()[:1] == [first] and difflib.SequenceMatcher(None, other, name).ratio() >= 0.8
     cands = [c for c in sheets.all_contacts() if c.get("chat_id") and similar(c["Имя"])]
     since = time.time() - 4 * 86400
-    with_link, with_time = [], []
-    marks = (f"{dt:%H:%M}", f"{dt:%H.%M}", f"{dt.hour}:{dt:%M}", f"{dt.hour}.{dt:%M}", f"в {dt.hour}")
+    with_link, with_time, talked, active = [], [], [], []
+    marks = (f"{dt:%H:%M}", f"{dt:%H.%M}", f"{dt:%H,%M}", f"{dt.hour}:{dt:%M}", f"{dt.hour}.{dt:%M}",
+             f"{dt.hour},{dt:%M}", f"в {dt.hour}")
     for c in cands:
-        recent = [m for m in _load_dialog(user_id, c["chat_id"]) if m["created"] >= since]
+        dialog = _load_dialog(user_id, c["chat_id"])
+        recent = [m for m in dialog if m["created"] >= since]
+        said_time = any(mk in m["text"] for m in recent for mk in marks)
         if any(m["direction"] == "out" and ZOOM_MARK in m["text"] for m in recent):
             with_link.append(c)
-            if any(mk in m["text"] for m in recent for mk in marks):
+            if said_time:
                 with_time.append(c)
-    pick = with_link if len(with_link) == 1 else with_time if len(with_time) == 1 else []
+        if said_time:
+            talked.append(c)
+        if any(m["created"] >= time.time() - 14 * 86400 for m in dialog):
+            active.append(c)
+    # 24.11: Светлана часто записывает по телефону и ссылку не шлёт — тогда ищем по времени в переписке,
+    # а если клиент с таким именем за 2 недели вообще один — это он
+    pick = (with_time if len(with_time) == 1 else with_link if len(with_link) == 1 else
+            talked if len(talked) == 1 else active if len(active) == 1 and not with_link else [])
     chat = pick[0]["chat_id"] if pick else ""
     if not chat and not notify:
         _chat_miss[key] = time.time()
@@ -1846,9 +1863,20 @@ def _booking_cancel(user_id: int, chat: str, b: dict, dt: datetime, made: dateti
                  and m["created"] <= dt.timestamp()]
         made = datetime.fromtimestamp(links[-1], MSK) if links else made
     after = [m for m in dialog if m["created"] > made.timestamp() + 60 and not _is_reminder(m["text"])]
-    return next((m["text"] for m in after if
-                 (m["direction"] == "in" and (CANCEL_RE.search(m["text"]) or analyze_dialog([m])["declined"]))
-                 or (m["direction"] == "out" and OUR_CANCEL_RE.search(m["text"]))), "")
+    # 24.11 Анастасия: «мы не успеваем в 16:30 — есть в пятницу на 19:00?» → «да, 19.00», и в листе уже 19:00.
+    # Перенос на то время, что в листе, — не отмена: отменой считаем только то, что было после последнего
+    # упоминания времени из листа.
+    marks = (f"{dt:%H:%M}", f"{dt:%H.%M}", f"{dt:%H,%M}", f"{dt.hour}:{dt:%M}", f"{dt.hour}.{dt:%M}",
+             f"{dt.hour},{dt:%M}") + ((f"на {dt.hour}", f"в {dt.hour}") if dt.minute == 0 else ())
+    def cancels(m):
+        return ((m["direction"] == "in" and (CANCEL_RE.search(m["text"]) or analyze_dialog([m])["declined"]))
+                or (m["direction"] == "out" and OUR_CANCEL_RE.search(m["text"])))
+
+    said = [i for i, m in enumerate(after) if not cancels(m) and any(
+        re.search(rf"(?<!\d){re.escape(mk)}(?!\d|[:.,]\d)", m["text"]) for mk in marks)]
+    if said:
+        after = after[said[-1] + 1:]
+    return next((m["text"] for m in after if cancels(m)), "")
 
 
 _last_chats = []  # чаты последней проверки Avito
@@ -1989,14 +2017,8 @@ def _trial_reminders(user_id: int) -> None:
                                           f"«{cancel[:200]}». Проверьте, в силе ли пробный, — если перенесли, "
                                           "поменяйте время в листе «Записаны на пробный».")
                 continue
-            human = _human_text(chat, _load_dialog(user_id, chat))
-            if human:
-                for k2 in (k for k, *_ in REMINDERS):  # ни одного напоминания по этой записи, сообщение Роману одно
-                    _reminded.add(f"rem{k2}_{chat}_{dt:%d%m%H%M}")
-                    sheets.set_state(f"rem{k2}_{chat}_{dt:%d%m%H%M}", f"не отправлено (пишет человек): {_now()}")
-                tg.send_message(ADMIN_ID, f"⏸ Не напоминаю {name} о пробном {dt:%d.%m в %H:%M}: в этом чате клиенту "
-                                          f"писали вы или Светлана ({human}). Напомните сами, если нужно.")
-                continue
+            # 24.11, Роман: «напоминай всем клиентам из таблицы пробных … за 3 часа и за 30 минут» — и в чатах,
+            # где переписку вели он или Светлана (с 23.11 там напоминания не уходили)
             text = _reminder_text(kind, name, dt, now)
             try:
                 _avito_send(user_id, chat, text)
