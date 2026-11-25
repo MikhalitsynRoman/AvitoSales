@@ -217,20 +217,31 @@ def analyze_dialog(messages: list[dict], now: datetime | None = None) -> dict:
     day = _requested_date(batch_text, last_in_time)
 
     # время: что предлагали мы последним сообщением и что выбрал клиент
-    our_times = [x.replace(".", ":").zfill(5) for x in TIME_RE.findall(our_last["text"])] if our_last else []
-    our_day = None
-    if our_last and our_times:
-        our_day = _requested_date(our_last["text"], _dt(our_last["created"])) or _dt(our_last["created"]).date()
+    our_offer = offer_pairs(our_last["text"], _dt(our_last["created"])) if our_last else []
+    our_times = [t for _, t in our_offer]
+    our_day = our_offer[0][0] if our_offer else None
     client_time = _client_time(batch_text)
     agrees = bool(AGREE_RE.search(batch_text)) and not DECLINE_TIME_RE.search(batch_text)
 
     confirmed = None  # (дата, "HH:MM") — о чём договорились
-    choose_between = []
+    choose_between, ask_day = [], []
+    multi_day = len({d for d, _ in our_offer}) > 1
     if client_time:
-        confirmed = (day or (our_day if client_time in our_times else None) or last_in_time.date(), client_time)
+        offered_days = sorted({d for d, t in our_offer if t == client_time})
+        if day or len(offered_days) <= 1:
+            confirmed = (day or (offered_days[0] if offered_days else None) or last_in_time.date(), client_time)
+        else:  # одно и то же время предлагали на разные дни — уточняем день
+            ask_day = offered_days
+    elif day and our_offer and not DECLINE_TIME_RE.search(batch_text) and len(batch_text) <= 60:
+        # «давайте в пятницу» в ответ на список окон по дням
+        that_day = [t for d, t in our_offer if d == day]
+        if len(that_day) == 1:
+            confirmed = (day, that_day[0])
+        elif len(that_day) >= 2:
+            choose_between, our_day = that_day[:2], day
     elif agrees and len(our_times) == 1:
         confirmed = (day or our_day, our_times[0])
-    elif agrees and len(our_times) >= 2:
+    elif agrees and len(our_times) >= 2 and not multi_day:
         choose_between = our_times[:2]
 
     bare_no = bool(BARE_NO_RE.match(batch_text))
@@ -275,6 +286,7 @@ def analyze_dialog(messages: list[dict], now: datetime | None = None) -> dict:
         "day": day,
         "confirmed": confirmed,
         "choose_between": choose_between,
+        "ask_day": ask_day,
         "time_passed": time_passed,
         "declined": not online_no and (bool(REFUSE_RE.search(batch_text)) or (bare_no and not asked_time)),
         "spam": bool(SPAM_RE.search(batch_text)),
@@ -297,6 +309,7 @@ def analyze_dialog(messages: list[dict], now: datetime | None = None) -> dict:
         else 2 if any(re.search(r"только\s+онлайн|онлайн\s+формате|проходят\s+онлайн", m["text"], re.I) for m in our_msgs)
         else 1,
         "our_times": our_times,
+        "our_offer": our_offer,
         "our_day": our_day,
         "our_last_text": our_last["text"] if our_last else "",
         "our_last_ts": our_last["created"] if our_last else 0,
@@ -345,6 +358,51 @@ def _requested_date(text: str, base: datetime) -> date | None:
         if w in low:
             return (base + timedelta(days=(i - base.weekday()) % 7 or 7)).date()
     return None
+
+
+_DAY_TOKEN_RE = re.compile(r"послезавтра|завтра|сегодня|" + "|".join(WEEKDAYS)
+                            + r"|\b\d{1,2}\s+(?:" + "|".join(MONTHS) + r")")
+
+
+def _token_date(tok: str, base: datetime) -> date | None:
+    if tok == "послезавтра":
+        return (base + timedelta(days=2)).date()
+    if tok == "завтра":
+        return (base + timedelta(days=1)).date()
+    if tok == "сегодня":
+        return base.date()
+    if tok in WEEKDAYS:
+        i = WEEKDAYS.index(tok)
+        return (base + timedelta(days=(i - base.weekday()) % 7 or 7)).date()
+    num, month = tok.split()
+    try:
+        d = date(base.year, MONTHS.index(month) + 1, int(num))
+    except ValueError:
+        return None
+    return d.replace(year=d.year + 1) if d < base.date() - timedelta(days=7) else d
+
+
+def offer_pairs(text: str, base: datetime) -> list[tuple[date, str]]:
+    """25.11: в одном сообщении предлагаем окна на несколько дней («• сегодня в 18:00 или в 21:30 • в пятницу,
+    27 ноября, в 17:00») — каждое время относим к последнему дню, названному перед ним."""
+    low = (text or "").lower()
+    toks = sorted([(m.start(), "d", m.group(0)) for m in _DAY_TOKEN_RE.finditer(low)]
+                  + [(m.start(), "t", m.group(0)) for m in TIME_RE.finditer(low)])
+    cur, out, last_day_pos, time_since = None, [], -100, True
+    for pos, kind, val in toks:
+        if kind == "d":
+            # «завтра (суббота)», «в пятницу, 27 ноября» — второе слово уточняет тот же день, а не называет другой;
+            # число с месяцем точнее дня недели
+            if not time_since and pos - last_day_pos <= 20 and not val[0].isdigit():
+                continue
+            cur = _token_date(val, base) or cur
+            last_day_pos, time_since = pos, False
+        else:
+            time_since = True
+            h, mm = re.split(r"[:.]", val)
+            if int(h) <= 23 and int(mm) <= 59:
+                out.append((cur or base.date(), f"{int(h):02d}:{mm}"))
+    return out
 
 
 def day_label(d: date, today: date) -> str:
@@ -504,6 +562,40 @@ def _offer(times: list[str], d: date, today: date, lead: str) -> str:
     return f"{lead} {w} в {times[0]} мск?"
 
 
+OFFER_DAYS = 3  # 25.11, Роман: «предлагай не только сегодня и завтра — сразу несколько вариантов»
+
+
+def _spread(times: list[str]) -> list[str]:
+    """Два окна дня в разное время суток: самое раннее и самое позднее, если между ними 3 часа и больше."""
+    if len(times) <= 1:
+        return times[:1]
+    m = lambda t: int(t[:2]) * 60 + int(t[3:])  # noqa: E731
+    later = [t for t in times if m(t) - m(times[0]) >= 180]
+    return [times[0], later[-1] if later else times[1]]
+
+
+def _multi_offer(a: dict, days: list[date], lead: str) -> str:
+    """Окна на 2–3 ближайших дня одним сообщением; одно и то же время на разные дни не повторяем —
+    тогда ответ «давайте в 17:00» понятен без уточнения дня."""
+    today = a["now"].date()
+    used, parts = set(), []
+    for d in days:
+        pick = _spread([t for t in _day_slots(a, d) if t not in used])
+        if not pick:
+            continue
+        used.update(pick)
+        parts.append((d, pick))
+        if len(parts) == OFFER_DAYS:
+            break
+    if not parts:
+        return ""
+    if len(parts) == 1:
+        return _offer(parts[0][1], parts[0][0], today, lead)
+    lines = [f"• {_when(d, today).rstrip(',')}{',' if d > today + timedelta(days=1) else ''} в {' или в '.join(ts)}"
+             for d, ts in parts]
+    return f"{lead}? Свободные окна (время московское):\n" + "\n".join(lines)
+
+
 def _time_question(slots: list[str], a: dict, polite: bool = True) -> str:
     today = a["now"].date()
     lead = "Скажите, пожалуйста, будет удобно подключиться" if polite else "Удобно подключиться"
@@ -511,6 +603,7 @@ def _time_question(slots: list[str], a: dict, polite: bool = True) -> str:
     if sched is not None:
         # есть расписание Романа на ближайшие дни — предлагаем конкретные свободные окна
         days = sorted(d for d in sched if _day_slots(a, d))
+        many = "Скажите, пожалуйста, когда вам будет удобно подключиться" if polite else "Когда удобно подключиться"
         if a["day"]:
             want = _day_slots(a, a["day"])
             if want:
@@ -519,10 +612,9 @@ def _time_question(slots: list[str], a: dict, polite: bool = True) -> str:
             if later:
                 lbl = day_label(a["day"], today)
                 return (f"{lbl[0].upper() + lbl[1:]}, к сожалению, свободных окон нет. "
-                        + _offer(_day_slots(a, later[0]), later[0], today, "Могу предложить").rstrip("?")
-                        + " — будет удобно?")
+                        + _multi_offer(a, later, "Когда будет удобно"))
         elif days:
-            return _offer(_day_slots(a, days[0]), days[0], today, lead)
+            return _multi_offer(a, days, many)
     if a["day"] and a["day"] != today:
         return f"Во сколько вам будет удобно подключиться {day_label(a['day'], today)}? Пробный идёт 30 минут."
     if len(slots) >= 2:
@@ -645,9 +737,9 @@ def generate_variants(client_name: str, client_text: str, slots_text: str = "", 
                 _say(o, f"Ой, на {hhmm} только что записался другой ученик. {offer}"),
                 _say(o, f"{hhmm} уже занято, извините! {offer}"),
             ]
-        return [
-            confirm_block(zoom_link),
+        return [  # 25.11: день и время — в первом же варианте: окна теперь на разные дни, клиенту нужна ясность
             confirm_block(zoom_link) + f"\n\nЖду вас {when}!",
+            confirm_block(zoom_link),
             confirm_block(zoom_link) + f"\n\nЖду вас {when}! Если планы изменятся — напишите, перенесём.",
         ]
 
@@ -685,6 +777,16 @@ def generate_variants(client_name: str, client_text: str, slots_text: str = "", 
                               "ближайшие дни — когда примерно будет удобно? Если не получится, просто перенесём."),
             _say(o, *answers, "Скорейшего выздоровления! Пробный урок онлайн, всего 30 минут — можно подключиться из "
                               "дома, как только станет лучше. Напишите, когда будет удобно."),
+        ]
+
+    # 4а. Назвал время, которое мы предлагали на разные дни
+    if a.get("ask_day"):
+        hhmm = _client_time(a["batch_text"]) or ""
+        opts = " или ".join(day_label(d, today) for d in a["ask_day"][:2])
+        return [
+            _say(o, f"Отлично! На какой день записать вас на {hhmm} — {opts}?"),
+            _say(o, f"Хорошо! {hhmm} — {opts}?"),
+            _say(o, f"Подскажите, пожалуйста, {hhmm} — это {opts}?"),
         ]
 
     # 4. Согласен, но не выбрал из двух предложенных времён
@@ -742,7 +844,8 @@ def generate_variants(client_name: str, client_text: str, slots_text: str = "", 
 
 RECOGNIZED = ("once_week_q", "asks_price", "asks_format", "wants_record", "agrees", "declines_time", "postpones", "declined",
               "phone_q", "duration_q", "group_q", "homework_q", "pay_q", "messenger_q", "thinks", "offline_only",
-              "choose_between", "day", "time_passed", "confirmed", "gave_phone", "take_grade_q", "price_detail_q")
+              "choose_between", "day", "time_passed", "confirmed", "gave_phone", "take_grade_q", "price_detail_q",
+              "ask_day")
 INFO_RE = re.compile(r"\d{1,2}\s*-?\s*(?:й|ый|ой)?\s*кл|^\s*\d{1,2}\s*$|егэ|огэ|профил|баз\w*\s+уров|\d{2,3}\s*\+|балл|"
                      r"^\s*(здравствуйте|добрый\s+(день|вечер)|доброе\s+утро|привет)\W*$", re.I)
 

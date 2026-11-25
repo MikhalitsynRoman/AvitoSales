@@ -289,12 +289,23 @@ def _channel_lead(name: str, client_text: str, taken: set, near_ts: float | None
 DEFAULT_NAME_RE = re.compile(r"^\s*(репетитор\s+по\s+математике.*|сделка\s*#\s*\d+|)\s*$", re.I)
 
 
-def rename_default(lead_id: int, name: str, city: str) -> str:
+def lead_title(name: str, city: str, label: str = "") -> str:
+    """25.11, Роман: «чтобы было понятно, что это за заявка»: «Инна — ОГЭ, 9 класс — Avito (Орёл)»."""
+    return (f"{name}" + (f" — {label}" if label else "") + " — Avito"
+            + (f" ({city})" if city and city != "—" else ""))[:250]
+
+
+def rename_default(lead_id: int, name: str, city: str, label: str = "") -> str:
+    """Переименовываем только сделки с названием по объявлению и те, что назвал сам бот («Имя — … Avito …»);
+    название, которое дал Роман, не трогаем."""
     if not name or name == "—":
         return ""
     cur = _get(f"leads/{lead_id}").get("name") or ""
-    title = (f"{name} — Avito" + (f" ({city})" if city and city != "—" else ""))[:250]
-    if cur == title or not DEFAULT_NAME_RE.match(cur):
+    title = lead_title(name, city, label)
+    ours = cur.startswith(f"{name} — ") and "Avito" in cur
+    if cur == title or not (DEFAULT_NAME_RE.match(cur) or ours):
+        return ""
+    if ours and not label:  # не стираем уже вписанный класс, если сейчас он неизвестен
         return ""
     _req("PATCH", f"leads/{lead_id}", body={"name": title})
     _log_match(f"«{name}»: сделку #{lead_id} назвал «{title}» (было «{cur}»)")
@@ -303,7 +314,7 @@ def rename_default(lead_id: int, name: str, city: str) -> str:
 
 def find_lead(name: str, phone: str | None, first_note: str, stage: str = "new",
               client_text: str = "", taken: set = frozenset(), create_city: str | None = None,
-              near_ts: float | None = None, city: str = "") -> int | None:
+              near_ts: float | None = None, city: str = "", label: str = "") -> int | None:
     """Сделку создаёт интеграция Avito ↔ amoCRM (19.11/20.11 Роман: «не бот их создавал, а они шли с Avito»). Сначала
     ищем её: по телефону, в «Неразобранном» (принимаем), среди принятых сделок. Не нашли: create_city is None — None
     (поищем снова); иначе создаём сами — 21.11 Роман: «они всегда должны попадать в амо», а интеграция с 17.11
@@ -317,13 +328,13 @@ def find_lead(name: str, phone: str | None, first_note: str, stage: str = "new",
         if how == "ambiguous":  # сделка интеграции, скорее всего, есть — просто не понять, какая; дубль не нужен
             create_city = None
     if not lead_id and create_city is not None:
-        return _create_lead(name, create_city, phone, contact_id, first_note, stage)
+        return _create_lead(name, create_city, phone, contact_id, first_note, stage, label)
     if not lead_id and how != "ambiguous":
         _log_match(f"«{name}»: сделки от интеграции Avito пока нет — жду её, через 15 минут создам сам")
         return None
     stats["created"] += 1  # в /status: «нашёл сделок»
     try:
-        rename_default(lead_id, name, city or create_city or "")
+        rename_default(lead_id, name, city or create_city or "", label)
     except RuntimeError as e:
         _fail(e)
     try:
@@ -335,11 +346,12 @@ def find_lead(name: str, phone: str | None, first_note: str, stage: str = "new",
     return lead_id
 
 
-def _create_lead(name: str, city: str, phone: str | None, contact_id: int | None, first_note: str, stage: str) -> int:
+def _create_lead(name: str, city: str, phone: str | None, contact_id: int | None, first_note: str, stage: str,
+                 label: str = "") -> int:
     contact = {"id": contact_id} if contact_id else {"first_name": name or "Клиент Avito"}
     if phone and not contact_id:
         contact["custom_fields_values"] = [{"field_code": "PHONE", "values": [{"value": phone, "enum_code": "WORK"}]}]
-    title = f"{name or 'Клиент'} — Avito" + (f" ({city})" if city and city != "—" else "")
+    title = lead_title(name or "Клиент", city, label)
     body = {"name": title[:250], "pipeline_id": _pipe["id"], "status_id": _pipe["stage"][stage],
             "_embedded": {"contacts": [contact], "tags": [{"name": TAG}]}}
     if owner_id():

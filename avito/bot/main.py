@@ -791,17 +791,20 @@ def _send_to_client(user_id: int, row_id: str, text: str, status: str) -> bool:
             who = "Бот ответил сам" if "бот сам" in status else "Ответ из Telegram"
             _amo_safe("ответ клиенту", amo_crm.note, lead, f"{who} в Avito:\n{text}")
         if ZOOM_MARK in text:
-            _log_trial_booking(row_id, v)
+            _log_trial_booking(row_id, v, text)
     return True
 
 
-def _log_trial_booking(row_id: str, v: dict) -> None:
+def _log_trial_booking(row_id: str, v: dict, text: str = "") -> None:
     """Ушла ссылка на Zoom — значит, человек записан: заносим в «Записаны на пробный», окно становится занятым."""
     try:
         meta = json.loads(sheets.get_state(f"meta_{row_id}", "") or "{}")
     except ValueError:
         meta = {}
-    when = meta.get("book") or "время не определил — уточните в таблице"
+    # 25.11, Роман: «обязательно записывай в таблицу». Окно бот запоминает, когда готовит ответ; если не запомнил
+    # (ответ написали руками в Telegram), берём день и время из самого сообщения со ссылкой
+    guess = _time_in_text(text, datetime.now(MSK)) if text and not meta.get("book") else None
+    when = meta.get("book") or (f"{guess:%d.%m.%Y %H:%M}" if guess else "время не определил — уточните в таблице")
     if when in _own_keys(v["chat_id"], v["Имя"]):
         row_note = "Эта запись уже есть в листе «Записаны на пробный» — вторую строку не добавлял."
     else:
@@ -2244,6 +2247,13 @@ def _amo_taken() -> set:
     return {int(v[1]) for k, v in sheets._load_state().items() if k.startswith("amo_") and str(v[1]).isdigit()}
 
 
+def _amo_label(a: dict) -> str:
+    """«ОГЭ, 9 класс» / «ЕГЭ» / «7 класс» — для названия сделки в amoCRM."""
+    exam = a.get("category") if a.get("category") in ("ЕГЭ", "ОГЭ") else ""
+    grade = f"{a['grade']} класс" if a.get("grade") else ""
+    return ", ".join(x for x in (exam, grade) if x)
+
+
 def _amo_first_note(name: str, city: str, category: str, chat_id: str, client_text: str) -> str:
     return (f"Заявка с Avito\nКлиент: {name}, {city}\nКатегория: {category}\nЧат: {AVITO_CHAT_URL.format(chat_id)}"
             + (f"\n\nКлиент пишет:\n{client_text}" if client_text else ""))
@@ -2258,13 +2268,15 @@ def _amo_message(row_id: str, is_new: bool, name: str, city: str, category: str,
         if not lead:  # сделку создаёт интеграция Avito ↔ amoCRM — находим её (может появиться не сразу)
             lead = amo_crm.find_lead(name, a.get("phone"), _amo_first_note(name, city, category, chat_id, client_text),
                                      client_text=client_text, taken=_amo_taken(), create_city=city if create else None,
-                                     near_ts=near_ts or time.time(), city=city)
+                                     near_ts=near_ts or time.time(), city=city, label=_amo_label(a))
             _amo_save_log()
             if not lead:
                 return
             sheets.set_state(f"amo_{row_id}", str(lead))
         else:
             amo_crm.note(lead, f"Клиент пишет в Avito:\n{client_text}")
+            if _amo_label(a):  # класс/экзамен стали известны позже — дописываем в название сделки
+                amo_crm.rename_default(lead, name, city, _amo_label(a))
         written = _amo_written(row_id)
         booked = written.get("Комментарий", "").partition(" · пробный ")[2]
         comment = _amo_comment(city, a) + (f" · пробный {booked}" if booked else "")
