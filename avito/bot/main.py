@@ -305,10 +305,47 @@ def schedule(exclude: frozenset = frozenset()) -> dict | None:
 
 
 def _free_on(d, now, booked: set, taken: list) -> list[str]:
-    return [s for s in expand_slots(day_slots_text(d))
-            if not is_past(d, s, now) and booking_key(d, s) not in booked
-            and not any(abs((datetime.strptime(booking_key(d, s), "%d.%m.%Y %H:%M").replace(tzinfo=MSK)
-                             - t).total_seconds()) < 1800 for t in taken)]
+    busy = _calendar_busy()
+    out = []
+    for s in expand_slots(day_slots_text(d)):
+        if is_past(d, s, now) or booking_key(d, s) in booked:
+            continue
+        start = datetime.strptime(booking_key(d, s), "%d.%m.%Y %H:%M").replace(tzinfo=MSK)
+        if any(abs((start - t).total_seconds()) < 1800 for t in taken):
+            continue
+        # 26.11: в Google Календаре Романа в это время что-то есть (урок, группа, дела) — не предлагаем
+        if any(start < ev["end"] and start + timedelta(minutes=30) > ev["start"] for ev in busy):
+            continue
+        out.append(s)
+    return out
+
+
+# ---------- события Google Календаря Романа (26.11): занятое время не предлагаем клиентам ----------
+CAL_REFRESH = 5 * 60
+CAL_DAYS = 35
+_cal_cache = {"at": 0.0, "events": [], "error": "", "ok_at": 0.0}
+
+
+def _calendar_busy() -> list[dict]:
+    """События календаря на 5 недель вперёд, кэш 5 минут. Календарь не подключён или недоступен — [] (последний
+    удачный список, если он не старше часа), окна считаются как раньше по расписанию и записям."""
+    cal = sheets.get_state("gcal_id", "")
+    if not cal:
+        return []
+    if time.time() - _cal_cache["at"] < CAL_REFRESH:
+        return _cal_cache["events"]
+    _cal_cache["at"] = time.time()
+    now = datetime.now(MSK)
+    try:
+        own = {v.get("id") for v in _gcal_map().values()}
+        _cal_cache["events"] = gcal.busy_events(cal, now - timedelta(days=7), now + timedelta(days=CAL_DAYS), own)
+        _cal_cache["error"], _cal_cache["ok_at"] = "", time.time()
+    except Exception as e:
+        _cal_cache["error"] = f"{_hhmm()} {str(e)[:150]}"
+        _note_error("чтение Google Календаря", e)
+        if time.time() - _cal_cache["ok_at"] > 3600:
+            _cal_cache["events"] = []
+    return _cal_cache["events"]
 
 
 # ---------- Google Календарь (24.11, Роман): записи на пробный → события в его календаре ----------
@@ -445,13 +482,19 @@ def _schedule_week(offset: int = 0):
     booked = booked_set()
     taken = [t for t in (_parse_msk(b) for b in booked) if t]
     free = {d: _free_on(d, now, booked, taken) for d in days}
+    busy = {}
+    for ev in _calendar_busy():
+        s, e = ev["start"].astimezone(MSK), ev["end"].astimezone(MSK)
+        if monday <= s.date() <= days[-1]:
+            busy.setdefault(s.date(), []).append((s, min(e, datetime.combine(s.date(), datetime.max.time(), MSK)),
+                                                  ev["title"]))
     trials = {}
     for b in sheets.get_bookings():
         dt = _parse_msk(norm_when(b.get("Когда пробный урок", "")))
         if dt and monday <= dt.date() <= days[-1]:
             note = (b.get("Класс/цель") or "").strip().strip("—").strip()
             trials.setdefault(dt.date(), []).append((dt, (b.get("Имя") or "").strip().strip("—").strip(), note))
-    return monday, now, free, trials
+    return monday, now, free, trials, busy
 
 
 def _schedule_caption(monday, free: dict, trials: dict) -> str:
@@ -472,12 +515,14 @@ def _schedule_caption(monday, free: dict, trials: dict) -> str:
 
 
 def send_schedule(chat_id: int, offset: int = 0) -> None:
-    monday, now, free, trials = _schedule_week(offset)
+    monday, now, free, trials, busy = _schedule_week(offset)
+    if chat_id != ADMIN_ID:  # помощникам — без названий личных событий Романа
+        busy = {d: [(s, e, "Занято") for s, e, _ in evs] for d, evs in busy.items()}
     caption = _schedule_caption(monday, free, trials)
     nav = [("◀ Пред. неделя", f"sch:{offset - 1}")] if offset > 0 else []
     nav += [("След. неделя ▶", f"sch:{offset + 1}")] if offset < 4 else []
     try:
-        png = calendar_image.render_week(monday, now, free, trials)
+        png = calendar_image.render_week(monday, now, free, trials, busy)
         tg.send_photo(chat_id, png, caption, tg.inline_keyboard(nav) if nav else None)
     except Exception as e:  # картинка не получилась — хотя бы текстом
         _note_error("картинка расписания", e)
@@ -1280,7 +1325,9 @@ def status_text() -> str:
                      f"не удалось {u['fails']}, токенов {u['tokens_in']}+{u['tokens_out']}")
     cal = sheets.get_state("gcal_id", "")
     lines.append(f"📆 Google Календарь: {'пробные добавляю в ' + cal if cal else 'не подключён (/gcal)'}"
-                 + (f" · событий бота: {len(_gcal_map())}" if cal else ""))
+                 + (f" · событий бота: {len(_gcal_map())} · ваших занятых событий вижу: {len(_calendar_busy())}"
+                    if cal else "")
+                 + (f" · ошибка чтения: {_cal_cache['error']}" if cal and _cal_cache["error"] else ""))
     s = amo_crm.stats
     if not amo_crm.available():
         lines.append("📇 amoCRM: не подключён (нет AMO_DOMAIN / AMO_TOKEN)")

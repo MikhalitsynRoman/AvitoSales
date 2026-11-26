@@ -2,9 +2,11 @@
 
 Ходим тем же сервисным аккаунтом, что и в таблицу (credentials/service_account.json). Роман дал этому аккаунту
 доступ к своему календарю («Вносить изменения в мероприятия») и включил Google Calendar API в проекте аккаунта.
-Бот трогает только события, которые создал сам (их номера — в state gcal_map); чужие события не читает и не меняет.
+Бот меняет только события, которые создал сам (их номера — в state gcal_map); остальные события не меняет.
+26.11, Роман: «бот мог видеть мои события в календаре» — бот читает события календаря (только чтение) и не
+предлагает клиентам время, когда Роман занят. События на весь день и помеченные «Свободен» время не занимают.
 """
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 from google.auth.transport.requests import AuthorizedSession
 from google.oauth2.service_account import Credentials
@@ -75,6 +77,36 @@ def create_event(cal_id: str, start, title: str, description: str) -> str:
     data = _check(_s().post(f"{API}/calendars/{cal_id}/events", json=_body(start, title, description), timeout=20),
                   "создание события")
     return data["id"]
+
+
+def _parse_dt(v: dict) -> datetime | None:
+    s = (v or {}).get("dateTime")
+    if not s:
+        return None  # событие на весь день (только date) — время не занимает
+    return datetime.fromisoformat(s.replace("Z", "+00:00"))
+
+
+def busy_events(cal_id: str, start: datetime, end: datetime, skip_ids: set = frozenset()) -> list[dict]:
+    """События календаря, которые занимают время: [{"start", "end", "title"}] (aware datetime).
+    Без событий на весь день, отменённых, помеченных «Свободен» и событий самого бота (skip_ids)."""
+    out, token = [], None
+    for _ in range(10):
+        params = {"timeMin": start.isoformat(), "timeMax": end.isoformat(), "singleEvents": "true",
+                  "orderBy": "startTime", "maxResults": 250, "timeZone": TZ,
+                  "fields": "items(id,status,summary,start,end,transparency),nextPageToken"}
+        if token:
+            params["pageToken"] = token
+        data = _check(_s().get(f"{API}/calendars/{cal_id}/events", params=params, timeout=20), "чтение событий")
+        for ev in data.get("items", []):
+            if ev.get("status") == "cancelled" or ev.get("transparency") == "transparent" or ev.get("id") in skip_ids:
+                continue
+            s, e = _parse_dt(ev.get("start")), _parse_dt(ev.get("end"))
+            if s and e and e > s:
+                out.append({"start": s, "end": e, "title": (ev.get("summary") or "Занято").strip()[:60]})
+        token = data.get("nextPageToken")
+        if not token:
+            break
+    return out
 
 
 def delete_event(cal_id: str, event_id: str) -> None:

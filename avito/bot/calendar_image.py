@@ -27,6 +27,7 @@ TEXT = (32, 33, 36)
 BLUE = (26, 115, 232)
 RED = (234, 67, 53)
 FREE = (51, 182, 121)      # «шалфей» Google
+BUSY = (128, 134, 139)     # «графит» Google — события из календаря Романа
 TRIAL = (244, 81, 30)      # «мандарин» Google
 
 _DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fonts")
@@ -104,9 +105,9 @@ def week_title(monday: date) -> str:
     return f"{monday.day} {MONTHS[monday.month - 1]} – {sunday.day} {MONTHS[sunday.month - 1]}"
 
 
-def render_week(monday: date, now: datetime, free: dict, trials: dict) -> bytes:
-    """free — {дата: ["12:00", "12:30", …]} свободные окна; trials — {дата: [(datetime, имя, класс)]}.
-    Возвращает PNG."""
+def render_week(monday: date, now: datetime, free: dict, trials: dict, busy: dict | None = None) -> bytes:
+    """free — {дата: ["12:00", "12:30", …]} свободные окна; trials — {дата: [(datetime, имя, класс)]};
+    busy — {дата: [(начало, конец, название)]} события Google Календаря. Возвращает PNG."""
     from PIL import Image, ImageDraw  # здесь, а не наверху: пока pip ставит Pillow, бот всё равно запускается
     days = [monday + timedelta(days=i) for i in range(7)]
     events = {d: [] for d in days}
@@ -114,6 +115,11 @@ def render_week(monday: date, now: datetime, free: dict, trials: dict) -> bytes:
         for s, e in free_blocks(free.get(d, [])):
             events[d].append({"start": s, "end": e, "kind": "free", "title": "Свободно",
                               "sub": f"{_hm(s)}–{_hm(e)}"})
+        for s_dt, e_dt, title in (busy or {}).get(d, []):
+            s = s_dt.hour * 60 + s_dt.minute
+            e = max(s + 15, e_dt.hour * 60 + e_dt.minute if e_dt.date() == d else 24 * 60)
+            events[d].append({"start": s, "end": e, "kind": "busy", "title": title,
+                              "sub": f"{_hm(s)}–{_hm(min(e, 24 * 60 - 1))}"})
         for dt, name, note in trials.get(d, []):
             s = dt.hour * 60 + dt.minute
             events[d].append({"start": s, "end": s + 30, "kind": "trial", "title": name or "Пробный",
@@ -136,7 +142,10 @@ def render_week(monday: date, now: datetime, free: dict, trials: dict) -> bytes:
     # заголовок и легенда
     dr.text((X(20), X(14)), "Пробные занятия · " + week_title(monday), font=_font(19, True), fill=TEXT)
     lx = W - 20
-    for label, color in (("пробный записан", TRIAL), ("свободно для пробного", FREE)):
+    legend = (("пробный записан", TRIAL), ("свободно для пробного", FREE))
+    if any((busy or {}).values()):
+        legend = (("ваш календарь", BUSY),) + legend
+    for label, color in legend:
         tw = dr.textlength(label, font=_font(12)) / S
         lx -= tw
         dr.text((X(lx), X(19)), label, font=_font(12), fill=MUTED)
@@ -182,7 +191,7 @@ def render_week(monday: date, now: datetime, free: dict, trials: dict) -> bytes:
             y0, y1 = y_of(e["start"]) + 1, y_of(e["end"]) - 1
             end_dt = datetime.combine(d, datetime.min.time()).replace(tzinfo=now.tzinfo) + timedelta(minutes=e["end"])
             past = end_dt <= now
-            base = FREE if e["kind"] == "free" else TRIAL
+            base = {"free": FREE, "trial": TRIAL, "busy": BUSY}[e["kind"]]
             fill = _fade(base) if past else base
             dr.rounded_rectangle([X(x0), X(y0), X(x1), X(y1)], radius=X(5), fill=fill,
                                  outline=(255, 255, 255), width=S)
