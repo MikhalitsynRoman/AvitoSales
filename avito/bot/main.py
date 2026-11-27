@@ -18,7 +18,7 @@ import ai_reply  # noqa: E402
 import calendar_image  # noqa: E402
 import gcal  # noqa: E402
 import amo_crm  # noqa: E402
-from script_engine import (MONTHS, REFUSE_RE, TIME_RE, ZOOM_MARK, _client_time, _requested_date,  # noqa: E402
+from script_engine import (AGREE_RE, MONTHS, REFUSE_RE, TIME_RE, ZOOM_MARK, _client_time, _requested_date,  # noqa: E402
                            analyze_dialog, auto_decision, booking_key,
                            category_text, confirm_block, day_label, expand_slots, generate_variants, is_past)
 
@@ -235,13 +235,31 @@ def today_slots() -> str:
     return sheets.get_state("slots_text", "")
 
 
+_WHEN_RE = re.compile(r"^\s*(\d{1,2})\s*[.,/ю]\s*(\d{1,2})(?:\s*[.,/ю]\s*(\d{2,5}))?\D+?(\d{1,2})\s*[:.,]\s*(\d{2})")
+
+
 def norm_when(value: str) -> str:
-    """«19.11.2026 20.30» / «19.11.2026 9:00» → «19.11.2026 20:30» / «19.11.2026 09:00» (записи, внесённые руками)."""
-    m = re.match(r"^\s*(\d{1,2})\.(\d{1,2})\.(\d{4})\s+(\d{1,2})[:.,](\d{2})\s*$", value or "")
+    """«19.11.2026 20.30» / «19.11.2026 9:00» → «19.11.2026 20:30» / «19.11.2026 09:00» (записи, внесённые руками).
+    27.11: в листе встречались «25.11.2026 17:00:00», «26.11ю2026 17.00», «24.11.2026 17.30екб», «20.11.20206 20.00» —
+    бот их не понимал и не напоминал. Теперь лишнее после времени и опечатки в разделителях и годе не мешают."""
+    m = _WHEN_RE.match(value or "")
     if not m:
         return (value or "").strip()
     d, mo, y, h, mi = m.groups()
-    return f"{int(d):02d}.{int(mo):02d}.{y} {int(h):02d}:{mi}"
+    today = datetime.now(MSK).date()
+    year = int(y) if y and len(y) == 4 else (2000 + int(y) if y and len(y) == 2 else today.year)
+    if not (y and len(y) in (2, 4)) and (int(mo), int(d)) < (today.month, today.day) and today.month == 12 and int(mo) == 1:
+        year += 1  # «05.01» в декабре — это следующий год
+    if not (1 <= int(d) <= 31 and 1 <= int(mo) <= 12 and int(h) <= 23 and int(mi) <= 59):
+        return (value or "").strip()
+    if re.search(r"ек[бa]|екат|yekat|ekb", (value or "")[m.end():].lower()):
+        # «17.30екб» — время Екатеринбурга (МСК+2): 24.11 Екатерина подключилась в 15:37 по Москве
+        try:
+            t = datetime(year, int(mo), int(d), int(h), int(mi)) - timedelta(hours=2)
+        except ValueError:
+            return (value or "").strip()
+        return f"{t:%d.%m.%Y %H:%M}"
+    return f"{int(d):02d}.{int(mo):02d}.{year} {int(h):02d}:{mi}"
 
 
 def booked_set(exclude: frozenset = frozenset()) -> set:
@@ -926,7 +944,7 @@ def _log_trial_booking(row_id: str, v: dict, text: str = "") -> None:
         row_note = "Эта запись уже есть в листе «Записаны на пробный» — вторую строку не добавлял."
     else:
         try:
-            sheets.log_booking(v["Имя"], meta.get("phone") or "—", v["chat_id"], when, v["Категория"])
+            _log_booking(v["Имя"], meta.get("phone") or "—", v["chat_id"], when, v["Категория"])
             row_note = "Строка добавлена в лист «Записаны на пробный»."
         except Exception as e:
             _note_error("запись в лист «Записаны на пробный»", e)
@@ -1105,7 +1123,7 @@ def _book_do(user_id: int, row_id: str, v: dict, dt: datetime, send: bool, messa
         if lead:
             _amo_safe("ответ клиенту", amo_crm.note, lead, f"Ответ из Telegram в Avito:\n{text}")
     try:
-        sheets.log_booking(v["Имя"], phone or "—", v["chat_id"], when, v["Категория"])
+        _log_booking(v["Имя"], phone or "—", v["chat_id"], when, v["Категория"])
     except Exception as e:
         _note_error("запись в лист «Записаны на пробный»", e)
         tg.edit_message_text(ADMIN_ID, message_id, f"❌ Не смог внести {v['Имя']} на {when} в лист «Записаны на "
@@ -1603,7 +1621,7 @@ def handle_message(user_id: int, msg: dict) -> None:
         fields = [p.strip() for p in text[len("/booked"):].split("|")]
         fields += ["—"] * (5 - len(fields))
         name, phone, when, goal, chat_id = fields[:5]
-        sheets.log_booking(name, phone, chat_id, when, goal)
+        _log_booking(name, phone, chat_id, when, goal)
         tg.send_message(ADMIN_ID, f"Записал в таблицу бронирований: {name}, {phone}, {when}")
         return
 
@@ -2046,8 +2064,8 @@ def avito_link_bookings(user_id: int) -> None:
         if not c:
             continue
         dialog = _load_dialog(user_id, cid)
-        links = [i for i, m in enumerate(dialog) if m["direction"] == "out" and ZOOM_MARK in m["text"]
-                 and not _is_reminder(m["text"]) and now.timestamp() - m["created"] <= 3 * 86400]
+        links = [i for i, m in enumerate(dialog) if now.timestamp() - m["created"] <= 3 * 86400
+                 and not _is_reminder(m["text"]) and _booking_signal(cid, dialog, i)]
         if not links:
             continue
         i = links[-1]
@@ -2091,7 +2109,7 @@ def avito_link_bookings(user_id: int) -> None:
             sheets.set_state(key, f"не добавлял: {when}")
             continue
         try:
-            sheets.log_booking(v["Имя"], "—", cid, when, v.get("Категория", ""))
+            _log_booking(v["Имя"], "—", cid, when, v.get("Категория", ""))
         except Exception as e:
             _note_error("запись в лист «Записаны на пробный»", e)
             tg.send_message(ADMIN_ID, f"❌ Вижу запись {v['Имя']} ({v['Город']}) на {when} в Avito, но НЕ смог внести её "
@@ -2099,13 +2117,136 @@ def avito_link_bookings(user_id: int) -> None:
             sheets.set_state(key, f"ошибка записи: {when}")
             continue
         sheets.set_state(key, f"добавил {when}")
-        _amo_safe("запись в Avito", _amo_set_booked, v["id"], v, None, when, "Ссылка Zoom отправлена в Avito.")
+        how = "Ссылка Zoom отправлена в Avito." if ZOOM_MARK in link["text"] else \
+            "Записали в чате Avito (менеджер или Роман)."
+        _amo_safe("запись в Avito", _amo_set_booked, v["id"], v, None, when, how)
         late = dt - now < timedelta(minutes=10)
         tg.send_message(ADMIN_ID, f"📅 Вижу запись в Avito: {v['Имя']} ({v['Город']}), пробный "
                                   f"{day_label(dt.date(), now.date())} в {dt:%H:%M}. Добавил в «Записаны на пробный»"
                                   + (". Напомнить клиенту уже не успел." if late else
                                      ", напомню клиенту за 3 часа и за 30 минут.")
                                   + " Если время другое — поправьте в листе.")
+
+
+# 27.11, Роман: «Светлана звонит и назначает пробные, пишет о них в чате — бот этого не читает и не записывает».
+# Признак записи в чате: наша ссылка Zoom (не напоминание); или НЕ бот написал утверждение о записи
+# («Записала вас на пятницу в 17:00», «Ждём вас завтра в 19.00», «Договорились: суббота 12:00»); или НЕ бот спросил
+# «Записываю на пробный?», а клиент ответил «да». Время берём из этих сообщений (сегодня/завтра — от их даты).
+BOOK_SAID_RE = re.compile(r"записал[аи]?\b|записываю\s+вас|вы\s+записаны|жд[уё]м?\s+вас|буд[уе]м\s+ждать|"
+                          r"договорились|до\s+встречи|подтвержда\w*\s+(?:запись|пробн)|"
+                          r"пробн\w*\s+(?:урок|заняти\w*)\s+(?:назначен|будет|состоится)", re.I)
+BOOK_ASK_RE = re.compile(r"запис(?:ываю|ать|ывать|ать\s+вас)\b|запишу", re.I)
+NOT_BOOK_RE = re.compile(r"(?<![а-яё])не\s+(?:записал|сможем|получится)|отмен|перенес", re.I)
+
+
+def _is_bot_message(chat_id: str, m: dict) -> bool:
+    try:
+        mine = json.loads(sheets.get_state(f"bs_{chat_id[:24]}", "") or "[]")
+    except ValueError:
+        mine = []
+    return m.get("id") in {x[0] for x in mine if x[0]} or _text_hash(m["text"]) in {x[2] for x in mine}
+
+
+def _booking_signal(chat_id: str, dialog: list[dict], i: int) -> bool:
+    m = dialog[i]
+    if m["direction"] == "out" and ZOOM_MARK in m["text"]:
+        return True
+    if m["direction"] == "out" and BOOK_SAID_RE.search(m["text"]) and "?" not in m["text"] \
+            and not NOT_BOOK_RE.search(m["text"]) and _client_time(m["text"]) and not _is_bot_message(chat_id, m):
+        return True
+    if m["direction"] == "in" and AGREE_RE.search(m["text"]) and len(m["text"]) <= 60 and i > 0:
+        prev = dialog[i - 1]
+        # «Записываю на пробный?» / «Давайте в 16.30 запишу в пятницу» → «Да, отлично» / «Давайте»
+        return (prev["direction"] == "out" and BOOK_ASK_RE.search(prev["text"]) and not NOT_BOOK_RE.search(prev["text"])
+                and not _is_bot_message(chat_id, prev))
+    return False
+
+
+# ---------- записи бота не теряются (27.11) ----------
+# В листе «Записаны на пробный» строки бота очищали руками: стирали имя и время, chat_id в последней колонке оставался
+# (Ольга, Пенза, 27.11 16:30 — запись пропала, напоминания не было бы). Бот помнит каждую свою запись (state mybook).
+# Строки нет, а в чате нет отмены или переноса — один раз возвращаем её и говорим Роману; стёрли повторно — значит,
+# так и задумано: больше не возвращаем.
+
+def _mybook() -> list[dict]:
+    try:
+        return [x for x in json.loads(sheets.get_state("mybook", "") or "[]") if isinstance(x, dict)]
+    except ValueError:
+        return []
+
+
+def _log_booking(name: str, phone: str, chat_id: str, when: str, goal: str) -> None:
+    sheets.log_booking(name, phone, chat_id, when, goal)
+    if _parse_msk(when):
+        keep = [x for x in _mybook() if (_parse_msk(x.get("when", "")) or datetime.now(MSK)) > datetime.now(MSK)
+                - timedelta(days=2) and not (x.get("chat") == chat_id and x.get("when") == when)]
+        keep.append({"chat": chat_id, "name": name, "when": norm_when(when), "goal": goal, "restored": 0})
+        sheets.set_state("mybook", json.dumps(keep[-60:], ensure_ascii=False))
+
+
+def restore_erased_bookings(user_id: int) -> None:
+    now = datetime.now(MSK)
+    books = sheets.get_bookings()
+    mine, changed = _mybook(), False
+    for x in list(mine):
+        dt = _parse_msk(x.get("when", ""))
+        if not dt or dt < now:
+            mine.remove(x)
+            changed = True
+            continue
+        first = (x.get("name") or "").strip().lower().split()[:1]
+
+        def same_client(b):
+            # по имени; по chat_id — только если имени в строке нет: в перезаписанных руками строках остаётся чужой
+            # chat_id (Berkovich в строке с chat_id Оксаны)
+            bname = (b.get("Имя") or "").strip().lower().split()[:1]
+            return bool(first and bname == first) or (not bname and (b.get("chat_id") or "").strip() == x["chat"])
+        rows = [b for b in books if same_client(b) and _parse_msk(b.get("Когда пробный урок", ""))]
+        if any(norm_when(b.get("Когда пробный урок", "")) == x["when"] for b in rows):
+            continue  # строка на месте
+        if any(_parse_msk(b.get("Когда пробный урок", "")) > now for b in rows):
+            mine.remove(x)  # у клиента в листе другое будущее время — перенесли руками
+            changed = True
+            continue
+        b0 = {"Имя": x.get("name", ""), "chat_id": x["chat"], "Когда пробный урок": x["when"], "Дата и время": ""}
+        cancel = _booking_cancel(user_id, x["chat"], b0, dt, dt - timedelta(days=3))
+        if cancel or x.get("restored"):
+            mine.remove(x)
+            changed = True
+            tg.send_message(ADMIN_ID, f"🗑 Запись {x.get('name')} на {dt:%d.%m в %H:%M} убрали из листа "
+                            + (f"(в чате: «{cancel[:120]}»)" if cancel else "второй раз")
+                            + " — считаю пробный отменённым и не напоминаю.")
+            continue
+        try:
+            sheets.log_booking(x.get("name", ""), "—", x["chat"], x["when"], x.get("goal", ""))
+        except Exception as e:
+            _note_error("возврат записи в лист", e)
+            continue
+        x["restored"] = 1
+        changed = True
+        c = sheets.find_contact_by_chat(x["chat"])
+        city = f" ({c['values']['Город']})" if c else ""
+        tg.send_message(ADMIN_ID, f"↩️ Из листа «Записаны на пробный» пропала запись {x.get('name')}{city} — пробный "
+                                  f"{day_label(dt.date(), now.date())} в {dt:%H:%M}. Отмены в чате не было, поэтому вернул "
+                                  "строку и напомню клиенту. Если пробного нет — удалите строку ещё раз, второй раз "
+                                  "возвращать не буду.")
+    if changed:
+        sheets.set_state("mybook", json.dumps(mine, ensure_ascii=False))
+
+
+def booking_rows_check() -> None:
+    """Строки «Записаны на пробный», где бот не понял время, — один раз Роману: без времени нет напоминаний."""
+    for b in sheets.get_bookings():
+        raw = (b.get("Когда пробный урок") or "").strip()
+        if not raw or _parse_msk(raw):
+            continue
+        key = f"badwhen_{_text_hash(raw + (b.get('Имя') or ''))}"
+        if sheets.get_state(key, ""):
+            continue
+        sheets.set_state(key, _now())
+        tg.send_message(ADMIN_ID, f"⚠️ В листе «Записаны на пробный» не понял время у «{(b.get('Имя') or '').strip() or '—'}»: "
+                                  f"«{raw}». Напишите как дд.мм.гггг ЧЧ:ММ (например 28.11.2026 17:30) — иначе не смогу "
+                                  "напомнить клиенту о пробном.")
 
 
 def _trial_reminders(user_id: int) -> None:
@@ -2856,6 +2997,11 @@ def _run_avito_check(user_id: int) -> None:
             _trial_reminders(user_id)
         except Exception as e:
             _note_error("напоминания о пробном", e)
+        try:
+            booking_rows_check()
+            restore_erased_bookings(user_id)
+        except Exception as e:
+            _note_error("проверка листа записей", e)
         gcal_sync()
         try:
             amo_sync_bookings_once()
