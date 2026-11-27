@@ -28,7 +28,7 @@ BLUE = (26, 115, 232)
 RED = (234, 67, 53)
 FREE = (51, 182, 121)      # «шалфей» Google
 BUSY = (128, 134, 139)     # «графит» Google — события из календаря Романа
-TRIAL = (244, 81, 30)      # «мандарин» Google
+TRIAL = (142, 36, 170)     # «виноград» Google — как события пробных в календаре Романа (27.11)
 
 _DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fonts")
 _fonts = {}

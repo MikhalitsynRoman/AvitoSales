@@ -402,6 +402,13 @@ def gcal_sync(report: bool = True) -> tuple[list, list]:
     cal = sheets.get_state("gcal_id", "")
     if not cal or time.time() < _gcal_retry_at[0]:
         return [], []
+    if sheets.get_state("gcal_color", "") != gcal.COLOR_TRIAL:  # 27.11: уже созданные события пробных — в фиолетовый
+        try:
+            for v in _gcal_map().values():
+                gcal.set_color(cal, v["id"])
+            sheets.set_state("gcal_color", gcal.COLOR_TRIAL)
+        except Exception as e:
+            _note_error("Google Календарь: цвет событий", e)
     now = datetime.now(MSK)
     current = {}
     for b in sheets.get_bookings():

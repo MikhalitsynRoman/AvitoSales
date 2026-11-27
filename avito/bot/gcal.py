@@ -16,7 +16,7 @@ from config import CREDENTIALS_FILE
 API = "https://www.googleapis.com/calendar/v3"
 TZ = "Europe/Moscow"
 TRIAL_MINUTES = 30
-COLOR_TANGERINE = "6"  # тот же оранжевый, что у пробных в /schedule
+COLOR_TRIAL = "3"  # 27.11, Роман: «сделай все мероприятия фиолетовым» — «Виноград» Google, как пробные в /schedule
 
 _session = None
 
@@ -68,9 +68,17 @@ def _body(start, title: str, description: str) -> dict:
         "description": description,
         "start": {"dateTime": start.isoformat(), "timeZone": TZ},
         "end": {"dateTime": end.isoformat(), "timeZone": TZ},
-        "colorId": COLOR_TANGERINE,
+        "colorId": COLOR_TRIAL,
         "reminders": {"useDefault": True},
     }
+
+
+def set_color(cal_id: str, event_id: str, color: str = COLOR_TRIAL) -> None:
+    """Только цвет события бота; удалённое руками событие — не ошибка."""
+    resp = _s().patch(f"{API}/calendars/{cal_id}/events/{event_id}", json={"colorId": color}, timeout=20)
+    if resp.status_code in (404, 410):
+        return
+    _check(resp, "смена цвета")
 
 
 def create_event(cal_id: str, start, title: str, description: str) -> str:
