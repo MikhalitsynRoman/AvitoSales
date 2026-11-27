@@ -73,9 +73,10 @@ def _body(start, title: str, description: str) -> dict:
     }
 
 
-def set_color(cal_id: str, event_id: str, color: str = COLOR_TRIAL) -> None:
-    """Только цвет события бота; удалённое руками событие — не ошибка."""
-    resp = _s().patch(f"{API}/calendars/{cal_id}/events/{event_id}", json={"colorId": color}, timeout=20)
+def set_color(cal_id: str, event_id: str, color: str = COLOR_TRIAL, title: str = "") -> None:
+    """Цвет (и название) события бота; удалённое руками событие — не ошибка."""
+    body = {"colorId": color, **({"summary": title} if title else {})}
+    resp = _s().patch(f"{API}/calendars/{cal_id}/events/{event_id}", json=body, timeout=20)
     if resp.status_code in (404, 410):
         return
     _check(resp, "смена цвета")

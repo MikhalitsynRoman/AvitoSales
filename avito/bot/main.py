@@ -398,17 +398,46 @@ def _gcal_desc(b: dict) -> str:
     return "\n".join(lines)
 
 
+def _gcal_title(name: str, note: str) -> str:
+    """27.11, Роман: «пиши просто ОГЭ Анастасия — класс и имя». Экзамен, иначе класс (9 — ОГЭ, 10–11 — ЕГЭ),
+    иначе короткая пометка из «Класс/цель» («коледж»)."""
+    note = (note or "").strip().strip("—").strip()
+    name = (name or "клиент").strip()
+    low = note.lower()
+    m = re.search(r"\b(\d{1,2})\s*-?\s*(?:й\s*)?кл", low)
+    if "огэ" in low:
+        label = "ОГЭ"
+    elif "егэ" in low:
+        label = "ЕГЭ"
+    elif m and m.group(1) == "9":
+        label = "ОГЭ"
+    elif m and m.group(1) in ("10", "11"):
+        label = "ЕГЭ"
+    elif m:
+        label = f"{m.group(1)} класс"
+    elif note and len(note) <= 20 and "(" not in note:
+        label = note
+    else:
+        label = ""
+    return f"{label} {name}".strip()
+
+
 def gcal_sync(report: bool = True) -> tuple[list, list]:
     cal = sheets.get_state("gcal_id", "")
     if not cal or time.time() < _gcal_retry_at[0]:
         return [], []
-    if sheets.get_state("gcal_color", "") != gcal.COLOR_TRIAL:  # 27.11: уже созданные события пробных — в фиолетовый
+    if sheets.get_state("gcal_color", "") != gcal.COLOR_TRIAL + "-title":
+        # 27.11: уже созданные события пробных — фиолетовые и с названием «ОГЭ Анастасия»
         try:
-            for v in _gcal_map().values():
-                gcal.set_color(cal, v["id"])
-            sheets.set_state("gcal_color", gcal.COLOR_TRIAL)
+            rows = {f"{norm_when(b.get('Когда пробный урок', ''))}|"
+                    f"{(b.get('Имя') or '').strip().strip('—').strip().lower()}": b for b in sheets.get_bookings()}
+            for k, v in _gcal_map().items():
+                b = rows.get(k, {})
+                gcal.set_color(cal, v["id"], title=_gcal_title(v.get("name") or b.get("Имя", ""),
+                                                               b.get("Класс/цель", "")))
+            sheets.set_state("gcal_color", gcal.COLOR_TRIAL + "-title")
         except Exception as e:
-            _note_error("Google Календарь: цвет событий", e)
+            _note_error("Google Календарь: цвет и названия событий", e)
     now = datetime.now(MSK)
     current = {}
     for b in sheets.get_bookings():
@@ -424,8 +453,7 @@ def gcal_sync(report: bool = True) -> tuple[list, list]:
         for key, (dt, name, b) in sorted(current.items(), key=lambda x: x[1][0]):
             if key in mp or dt < now:
                 continue
-            note = (b.get("Класс/цель") or "").strip().strip("—").strip()
-            title = f"Пробный: {name or 'клиент'}" + (f" ({note})" if note else "")
+            title = _gcal_title(name, b.get("Класс/цель") or "")
             mp[key] = {"id": gcal.create_event(cal, dt, title, _gcal_desc(b)), "when": f"{dt:%d.%m.%Y %H:%M}",
                        "name": name}
             sheets.set_state("gcal_map", json.dumps(mp, ensure_ascii=False))
