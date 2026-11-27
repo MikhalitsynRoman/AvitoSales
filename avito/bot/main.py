@@ -326,25 +326,40 @@ CAL_DAYS = 35
 _cal_cache = {"at": 0.0, "events": [], "error": "", "ok_at": 0.0}
 
 
+def _gcal_read_ids() -> list[str]:
+    """27.11, Роман: «Да, и «Учеба»» — календари, из которых бот только берёт занятое время (state gcal_read)."""
+    try:
+        return [x for x in json.loads(sheets.get_state("gcal_read", "") or "[]") if isinstance(x, str) and x]
+    except ValueError:
+        return []
+
+
 def _calendar_busy() -> list[dict]:
-    """События календаря на 5 недель вперёд, кэш 5 минут. Календарь не подключён или недоступен — [] (последний
-    удачный список, если он не старше часа), окна считаются как раньше по расписанию и записям."""
-    cal = sheets.get_state("gcal_id", "")
-    if not cal:
+    """События календарей на 5 недель вперёд, кэш 5 минут: основной (gcal_id, туда пишутся пробные) и дополнительные
+    (gcal_read). Календарь недоступен — берём его последний удачный список, если он не старше часа."""
+    cals = ([sheets.get_state("gcal_id", "")] if sheets.get_state("gcal_id", "") else []) + _gcal_read_ids()
+    if not cals:
         return []
     if time.time() - _cal_cache["at"] < CAL_REFRESH:
         return _cal_cache["events"]
     _cal_cache["at"] = time.time()
     now = datetime.now(MSK)
-    try:
-        own = {v.get("id") for v in _gcal_map().values()}
-        _cal_cache["events"] = gcal.busy_events(cal, now - timedelta(days=7), now + timedelta(days=CAL_DAYS), own)
-        _cal_cache["error"], _cal_cache["ok_at"] = "", time.time()
-    except Exception as e:
-        _cal_cache["error"] = f"{_hhmm()} {str(e)[:150]}"
-        _note_error("чтение Google Календаря", e)
-        if time.time() - _cal_cache["ok_at"] > 3600:
-            _cal_cache["events"] = []
+    own = {v.get("id") for v in _gcal_map().values()}
+    per = _cal_cache.setdefault("per", {})
+    errors = []
+    for cal in dict.fromkeys(cals):
+        try:
+            per[cal] = (time.time(), gcal.busy_events(cal, now - timedelta(days=7), now + timedelta(days=CAL_DAYS), own))
+        except Exception as e:
+            errors.append(f"{cal[:24]}: {str(e)[:120]}")
+            _note_error("чтение Google Календаря", e)
+            if cal in per and time.time() - per[cal][0] > 3600:
+                per.pop(cal)
+    for cal in list(per):
+        if cal not in cals:
+            per.pop(cal)
+    _cal_cache["events"] = [ev for _, evs in per.values() for ev in evs]
+    _cal_cache["error"] = f"{_hhmm()} " + "; ".join(errors) if errors else ""
     return _cal_cache["events"]
 
 
@@ -442,6 +457,25 @@ def gcal_sync(report: bool = True) -> tuple[list, list]:
 
 def _gcal_command(arg: str) -> None:
     email = gcal.service_email()
+    if arg[:1] in "+-" and arg[1:].strip():  # /gcal + ID — ещё один календарь только для занятого времени
+        cal, extra = arg[1:].strip().split()[0], _gcal_read_ids()
+        if arg[0] == "-":
+            sheets.set_state("gcal_read", json.dumps([x for x in extra if x != cal]))
+            _cal_cache["at"] = 0
+            tg.send_message(ADMIN_ID, "📆 Этот календарь больше не учитываю.")
+            return
+        try:
+            title = gcal.check_access(cal)
+        except Exception as e:
+            tg.send_message(ADMIN_ID, f"📆 Не вижу календарь {cal}: {str(e)[:250]}\n\nОткройте его для {email} "
+                                      "(достаточно «Просматривать все сведения о мероприятиях»).")
+            return
+        sheets.set_state("gcal_read", json.dumps(extra + ([cal] if cal not in extra else [])))
+        _cal_cache["at"] = 0
+        n = len([1 for _ in _calendar_busy()])
+        tg.send_message(ADMIN_ID, f"📆 Учитываю календарь «{title}»: в его события клиентам время не предлагаю. "
+                                  f"Всего вижу занятых событий: {n}. /gcal - {cal} — перестать учитывать.")
+        return
     if arg.lower() == "off":
         sheets.set_state("gcal_id", "")
         tg.send_message(ADMIN_ID, "📆 Больше не добавляю пробные в Google Календарь. Уже созданные события остались.")
@@ -453,7 +487,10 @@ def _gcal_command(arg: str) -> None:
                           f"добавить {email} с правом «Вносить изменения в мероприятия».\n"
                           "2. Там же, «Интеграция календаря» → скопировать «Идентификатор календаря» "
                           "(у основного календаря это ваш адрес Gmail).\n3. Прислать сюда: /gcal идентификатор\n\n"
-                          "/gcal off — перестать добавлять.")
+                          "Ещё календари, в чьи события не предлагать время (например «Учеба»): /gcal + идентификатор "
+                          "(доступ — «Просматривать все сведения о мероприятиях»).\n"
+                          + (f"Сейчас учитываю ещё: {', '.join(_gcal_read_ids())}\n" if _gcal_read_ids() else "")
+                          + "/gcal off — перестать добавлять пробные.")
         return
     cal = arg.split()[0]
     try:
@@ -1324,10 +1361,12 @@ def status_text() -> str:
         lines.append(f"🧠 DeepSeek: {'включён' if _ai_enabled() else 'выключен (/ai on)'} · сегодня запросов {u['calls']}, "
                      f"не удалось {u['fails']}, токенов {u['tokens_in']}+{u['tokens_out']}")
     cal = sheets.get_state("gcal_id", "")
+    extra = _gcal_read_ids()
     lines.append(f"📆 Google Календарь: {'пробные добавляю в ' + cal if cal else 'не подключён (/gcal)'}"
-                 + (f" · событий бота: {len(_gcal_map())} · ваших занятых событий вижу: {len(_calendar_busy())}"
-                    if cal else "")
-                 + (f" · ошибка чтения: {_cal_cache['error']}" if cal and _cal_cache["error"] else ""))
+                 + (f" · событий бота: {len(_gcal_map())}" if cal else "")
+                 + (f" · ещё календарей: {len(extra)}" if extra else "")
+                 + (f" · ваших занятых событий вижу: {len(_calendar_busy())}" if cal or extra else "")
+                 + (f" · ошибка чтения: {_cal_cache['error']}" if _cal_cache["error"] else ""))
     s = amo_crm.stats
     if not amo_crm.available():
         lines.append("📇 amoCRM: не подключён (нет AMO_DOMAIN / AMO_TOKEN)")
